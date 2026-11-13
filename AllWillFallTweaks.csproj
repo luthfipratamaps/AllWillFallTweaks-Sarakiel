@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <PropertyGroup>
     <Configuration Condition=" '$(Configuration)' == '' ">Release</Configuration>
@@ -13,6 +13,9 @@
     <Compile Include="src\AllWillFallTweaks.cs" />
     <Reference Include="ScriptsAssembly"><HintPath>$(GameDir)\All Will Fall_Data\Managed\ScriptsAssembly.dll</HintPath></Reference>
     <Reference Include="com.alelievr.NodeGraphProcessor.Runtime"><HintPath>$(GameDir)\All Will Fall_Data\Managed\com.alelievr.NodeGraphProcessor.Runtime.dll</HintPath></Reference>
+    <Reference Include="APC.FixedDataTypes"><HintPath>$(GameDir)\All Will Fall_Data\Managed\APC.FixedDataTypes.dll</HintPath></Reference>
+    <Reference Include="Unity.Collections"><HintPath>$(GameDir)\All Will Fall_Data\Managed\Unity.Collections.dll</HintPath></Reference>
+    <Reference Include="APC.Stats"><HintPath>$(GameDir)\All Will Fall_Data\Managed\APC.Stats.dll</HintPath></Reference>
     <Reference Include="netstandard"><HintPath>$(GameDir)\All Will Fall_Data\Managed\netstandard.dll</HintPath></Reference>
     <Reference Include="BepInEx"><HintPath>$(GameDir)\BepInEx\core\BepInEx.dll</HintPath></Reference>
     <Reference Include="UnityEngine"><HintPath>$(GameDir)\All Will Fall_Data\Managed\UnityEngine.dll</HintPath></Reference>

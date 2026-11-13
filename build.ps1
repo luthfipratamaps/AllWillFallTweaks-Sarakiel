@@ -59,6 +59,33 @@ try {
     Write-Host "[INFO] NodeGraphProcessor reference: $nodeGraph"
     $refFiles += $nodeGraph
 
+    # Production API reflection now touches ResourceBlock internals. Those refer
+    # to FixedIntArray16, defined in the game's APC.FixedDataTypes assembly.
+    $fixedTypes = Join-Path $managed 'APC.FixedDataTypes.dll'
+    if (-not (Test-Path -LiteralPath $fixedTypes)) {
+        throw "Missing required game dependency: $fixedTypes. Verify game files; do not download random DLLs."
+    }
+    Write-Host "[INFO] FixedDataTypes reference: $fixedTypes"
+    $refFiles += $fixedTypes
+
+    # APC.FixedDataTypes.FixedIntArray16 implements Unity.Collections.IIndexable<T>.
+    # Include the game-provided Unity.Collections assembly (do not download third-party DLLs).
+    $unityCollections = Join-Path $managed 'Unity.Collections.dll'
+    if (-not (Test-Path -LiteralPath $unityCollections)) {
+        throw "Missing required game dependency: $unityCollections. Verify your game files."
+    }
+    Write-Host "[INFO] Unity.Collections reference: $unityCollections"
+    $refFiles += $unityCollections
+
+    # WorkProvider implements IStatsUserComponent<BuildingStats> from APC.Stats.
+    # The type must be referenced when our speed patch uses WorkProvider directly.
+    $apcStats = Join-Path $managed 'APC.Stats.dll'
+    if (-not (Test-Path -LiteralPath $apcStats)) {
+        throw "Missing required game dependency: $apcStats. Verify your game files."
+    }
+    Write-Host "[INFO] APC.Stats reference: $apcStats"
+    $refFiles += $apcStats
+
     # A SINGLE-LINE, ANSI response file works reliably with the legacy .NET Framework csc.
     # v0.1.1 constructed the response arguments incorrectly and could pass a stray newline.
     # Build each fully-quoted token separately; never concatenate an array expression.

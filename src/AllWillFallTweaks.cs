@@ -12,7 +12,7 @@ using UnityEngine.SceneManagement;
 
 namespace Sarakiel.AllWillFall
 {
-    [BepInPlugin("id.sarakiel.allwillfall.resourcetweaks", "All Will Fall - Resource Tweaks", "0.7.2")]
+    [BepInPlugin("id.sarakiel.allwillfall.resourcetweaks", "All Will Fall - Resource Tweaks", "0.8.3.1")]
     public class ResourceTweaks : BaseUnityPlugin
     {
         private readonly string[] names = { "Water", "Food", "Junk", "Wood", "Metal", "Sand", "Fuel", "Goods", "Tools" };
@@ -30,6 +30,18 @@ namespace Sarakiel.AllWillFall
         private bool capacityTab;
         private bool constructionTab;
         private bool researchTab;
+        private bool productionTab;
+        private ConfigEntry<bool> productionYieldEnabled, productionSpeedEnabled;
+        private ConfigEntry<int> productionYieldMultiplier, productionSpeedMultiplier;
+        private bool productionAuditWritten;
+        private static MethodInfo producerProduceMethod;
+        private static bool replayingProduction;
+        private bool yieldHookReady, speedHookReady;
+        private readonly Dictionary<object, bool> resourceWorkProviderCache = new Dictionary<object, bool>(ReferenceEqualityComparer.Instance);
+        private static FieldInfo workProviderProducersField;
+        private bool warnedSpeedProviderRead;
+        private int productionYieldCalls, productionSpeedCalls;
+        private bool warnedProductionReplay;
         private ConfigEntry<bool> instantResearchRequested, freeResearchRequested;
         private Type researchManagerType;
         private MethodInfo forceCompleteResearchMethod;
@@ -147,6 +159,14 @@ namespace Sarakiel.AllWillFall
                 "Complete active research using the game's own ForceCompleteResearch(Research) API.");
             freeResearchRequested = Config.Bind("Research", "FreeResearch", true,
                 "Suppress research material payments without affecting construction or production costs.");
+            productionYieldEnabled = Config.Bind("Production", "YieldEnabled", false,
+                "Multiply only the final ResourceProducer.Produce batch (not input consumption).");
+            productionSpeedEnabled = Config.Bind("Production", "SpeedEnabled", false,
+                "Divide WorkProvider.WorkInterval for resource-producing buildings only. Experimental.");
+            productionYieldMultiplier = Config.Bind("Production", "YieldMultiplier", 10,
+                "Final produced resources multiplier; does not scale material costs.");
+            productionSpeedMultiplier = Config.Bind("Production", "SpeedMultiplier", 5,
+                "Resource-producer work interval divisor. Requires active workers; minimum interval is 0.1.");
             amountText = Math.Max(1, Math.Min(1000000, defaultAmount.Value)).ToString();
             window.x = Mathf.Clamp(savedX.Value, 0, Mathf.Max(0, Screen.width - window.width));
             window.y = Mathf.Clamp(savedY.Value, 0, Mathf.Max(0, Screen.height - window.height));
@@ -178,6 +198,7 @@ namespace Sarakiel.AllWillFall
             InstallConstructionOverrides();
             InstallConstructionDirectPatches();
             InstallResearchHooks();
+            InstallProductionHooks();
             // City data is unavailable during Awake; defer scene scan to AutoScanCity.
             nextAutoScanAt = Time.unscaledTime + 1f;
         }
@@ -331,6 +352,8 @@ namespace Sarakiel.AllWillFall
                 observedSceneHandle = sceneHandle;
                 queuedConstruction.Clear();
                 researchAuditWritten = false;
+                productionAuditWritten = false;
+                resourceWorkProviderCache.Clear();
                 researchManager = null;
                 lastCompletedResearch = null;
                 nextResearchDiscoveryAt = 0f;
@@ -368,9 +391,14 @@ namespace Sarakiel.AllWillFall
                     Logger.LogInfo("AUTO SCAN: CityResourceManager ready");
                     lastCountRefresh = -100f;
                 }
+                // One complete scan as soon as the city manager becomes ready.
+                // This resolves storage ownership and applies multipliers during
+                // initialization, not after the 30-second fallback window.
+                // Later scheduled checks use the inexpensive city registry.
+                bool initialCityScan = ready && !lastManagerReady;
                 lastManagerReady = ready;
                 Stopwatch scanWatch = Stopwatch.StartNew();
-                ScanStorageInstances(false);
+                if (ready) ScanStorageInstances(initialCityScan);
                 scanWatch.Stop();
                 RecordPerformance("Storage discovery", scanWatch.Elapsed.TotalMilliseconds, ref scannedStorageRuns, ref maxStorageScanMs);
                 Stopwatch syncWatch = Stopwatch.StartNew();
@@ -379,7 +407,7 @@ namespace Sarakiel.AllWillFall
                 RecordPerformance("Capacity synchronization", syncWatch.Elapsed.TotalMilliseconds, ref syncedCapacityRuns, ref maxCapacitySyncMs);
                 // Resource count discovery is expensive; the counts aren't visible
                 // while F8 is closed. Refresh only when the Resources tab is shown.
-                if (ready && visible && !capacityTab && !constructionTab && !researchTab)
+                if (ready && visible && !capacityTab && !constructionTab && !researchTab && !productionTab)
                 {
                     Stopwatch resourceWatch = Stopwatch.StartNew();
                     RefreshCounts();
@@ -536,16 +564,19 @@ namespace Sarakiel.AllWillFall
         {
             GUI.DrawTexture(new Rect(0, 0, 564, 4), primaryTex);
             GUI.Label(new Rect(19, 14, 400, 29), "ALL WILL FALL  /  TWEAKS", headingStyle);
-            GUI.Label(new Rect(22, 42, 450, 17), "SARAKIEL  •  TWEAKS DASHBOARD   v0.7.2", subtitleStyle);
+            GUI.Label(new Rect(22, 42, 450, 17), "SARAKIEL  •  TWEAKS DASHBOARD   v0.8.1", subtitleStyle);
             if (GUI.Button(new Rect(516, 18, 30, 28), "×", closeStyle)) { visible = false; pointerCaptured = false; SaveWindowPosition(); }
             GUI.DrawTexture(new Rect(18, 69, 528, 1), borderTex);
-            if (GUI.Button(new Rect(18, 77, 127, 30), "RESOURCES", !capacityTab && !constructionTab && !researchTab ? primaryStyle : buttonStyle)) { capacityTab = false; constructionTab = false; researchTab = false; }
-            if (GUI.Button(new Rect(151, 77, 127, 30), "CAPACITY", capacityTab ? primaryStyle : buttonStyle)) { capacityTab = true; constructionTab = false; researchTab = false; }
-            if (GUI.Button(new Rect(284, 77, 128, 30), "CONSTRUCTION", constructionTab ? primaryStyle : buttonStyle)) { constructionTab = true; capacityTab = false; researchTab = false; }
-            if (GUI.Button(new Rect(418, 77, 128, 30), "RESEARCH", researchTab ? primaryStyle : buttonStyle)) { researchTab = true; capacityTab = false; constructionTab = false; }
+            // Five compact tabs fit the existing window without hiding any controls.
+            if (GUI.Button(new Rect(18, 77, 100, 30), "RESOURCES", !capacityTab && !constructionTab && !researchTab && !productionTab ? primaryStyle : buttonStyle)) { capacityTab = false; constructionTab = false; researchTab = false; productionTab = false; }
+            if (GUI.Button(new Rect(125, 77, 100, 30), "CAPACITY", capacityTab ? primaryStyle : buttonStyle)) { capacityTab = true; constructionTab = false; researchTab = false; productionTab = false; }
+            if (GUI.Button(new Rect(232, 77, 100, 30), "BUILD", constructionTab ? primaryStyle : buttonStyle)) { constructionTab = true; capacityTab = false; researchTab = false; productionTab = false; }
+            if (GUI.Button(new Rect(339, 77, 100, 30), "RESEARCH", researchTab ? primaryStyle : buttonStyle)) { researchTab = true; capacityTab = false; constructionTab = false; productionTab = false; }
+            if (GUI.Button(new Rect(446, 77, 100, 30), "OUTPUT", productionTab ? primaryStyle : buttonStyle)) { productionTab = true; capacityTab = false; constructionTab = false; researchTab = false; }
             if (capacityTab) { DrawCapacityTab(); GUI.DragWindow(new Rect(0, 5, 500, 65)); return; }
             if (constructionTab) { DrawConstructionTab(); GUI.DragWindow(new Rect(0, 5, 500, 65)); return; }
             if (researchTab) { DrawResearchTab(); GUI.DragWindow(new Rect(0, 5, 500, 65)); return; }
+            if (productionTab) { DrawProductionTab(); GUI.DragWindow(new Rect(0, 5, 500, 65)); return; }
 
             GUI.Label(new Rect(19, 118, 85, 24), "ADD AMOUNT", mutedStyle);
             amountText = GUI.TextField(new Rect(113, 117, 133, 31), amountText, 8, inputStyle);
@@ -699,8 +730,8 @@ namespace Sarakiel.AllWillFall
                     foreach (DictionaryEntry item in map) RegisterStorage(item.Value, item.Key);
 
                 // Expensive fallback: discover ResourceBuilding components missing from
-                // the registry (unbuilt / newly spawned objects). Run only once per
-                // scene, on explicit Rescan, or every 30 s, never every 5 s.
+                // the registry. Force once on city readiness (and on manual Rescan),
+                // otherwise run at most every 30s. City registry checks run every 5s.
                 if (!force && Time.unscaledTime - lastFullStorageScan < FullStorageRescanSeconds) return;
                 lastFullStorageScan = Time.unscaledTime;
                 Type rbType = AccessTools.TypeByName("ResourceBuilding");
@@ -1429,6 +1460,218 @@ namespace Sarakiel.AllWillFall
             }
         }
 
+        // v0.8.3: Yield repeats ONLY the completed output handoff. It never
+        // invokes ConsumeRequirement or globally alters CityResourceManager.
+        // Re-entry guard prevents a nested Harmony postfix from multiplying
+        // the same batch again. No reflection or scene searches on each tick.
+        private void InstallProductionHooks()
+        {
+            if (harmony == null) harmony = new Harmony("id.sarakiel.allwillfall.resourcetweaks.ui");
+            try
+            {
+                producerProduceMethod = AccessTools.Method(typeof(ResourceProducer), "Produce", new [] { typeof(ResourceBlock) });
+                MethodInfo prefix = AccessTools.Method(typeof(ResourceTweaks), "CaptureProductionBatch");
+                MethodInfo postfix = AccessTools.Method(typeof(ResourceTweaks), "RepeatProductionBatch");
+                if (producerProduceMethod != null && prefix != null && postfix != null)
+                {
+                    harmony.Patch(producerProduceMethod, prefix: new HarmonyMethod(prefix), postfix: new HarmonyMethod(postfix));
+                    yieldHookReady = true;
+                    Logger.LogInfo("PRODUCTION YIELD PATCH: ResourceProducer.Produce(ResourceBlock) output replay ready");
+                }
+                else Logger.LogWarning("PRODUCTION YIELD: output method/signature missing; no changes applied");
+            }
+            catch (Exception ex) { Logger.LogWarning("PRODUCTION YIELD HOOK FAILED: " + ex.GetBaseException().Message); }
+
+            // The v0.8.2 runtime scan confirmed WorkProvider.get_WorkInterval() -> float,
+            // and WorkProvider.producers -> List<IWorkProducer>. Do not touch general
+            // work providers, including labs or jobs that have no ResourceProducer.
+            try
+            {
+                MethodInfo getter = AccessTools.Method(typeof(WorkProvider), "get_WorkInterval", Type.EmptyTypes);
+                MethodInfo postfix = AccessTools.Method(typeof(ResourceTweaks), "ProductionIntervalPostfix");
+                workProviderProducersField = AccessTools.Field(typeof(WorkProvider), "producers");
+                if (getter != null && getter.ReturnType == typeof(float) &&
+                    postfix != null && workProviderProducersField != null)
+                {
+                    harmony.Patch(getter, postfix: new HarmonyMethod(postfix));
+                    speedHookReady = true;
+                    Logger.LogInfo("PRODUCTION SPEED PATCH: WorkProvider.get_WorkInterval() for ResourceProducer jobs only");
+                }
+                else Logger.LogWarning("PRODUCTION SPEED: WorkInterval getter or producers field unavailable; no speed changes");
+            }
+            catch (Exception ex) { Logger.LogWarning("PRODUCTION SPEED PATCH FAILED: " + ex.GetBaseException().Message); }
+        }
+
+        // This hot-path patch is allocation-free once an individual provider has
+        // been recognized. Cache positive matches only: during scene loading the
+        // producers list may still be empty and could be populated later.
+        private static void ProductionIntervalPostfix(WorkProvider __instance, ref float __result)
+        {
+            ResourceTweaks mod = active;
+            if (mod == null || !mod.speedHookReady || __instance == null ||
+                !mod.productionSpeedEnabled.Value) return;
+            int factor = Math.Max(1, Math.Min(25, mod.productionSpeedMultiplier.Value));
+            if (factor <= 1 || __result <= 0f) return;
+            if (!mod.IsResourceProducingWorkProvider(__instance)) return;
+            __result = Math.Max(0.1f, __result / factor);
+            mod.productionSpeedCalls++;
+        }
+
+        private bool IsResourceProducingWorkProvider(WorkProvider provider)
+        {
+            bool cached;
+            if (resourceWorkProviderCache.TryGetValue(provider, out cached) && cached) return true;
+            try
+            {
+                object value = workProviderProducersField.GetValue(provider);
+                IEnumerable producers = value as IEnumerable;
+                if (producers == null) return false;
+                foreach (object producer in producers)
+                {
+                    if (producer is ResourceProducer)
+                    {
+                        resourceWorkProviderCache[provider] = true;
+                        return true;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                if (!warnedSpeedProviderRead)
+                {
+                    warnedSpeedProviderRead = true;
+                    Logger.LogWarning("PRODUCTION SPEED provider inspection failed: " + ex.GetBaseException().Message);
+                }
+            }
+            return false;
+        }
+
+        private static void CaptureProductionBatch(ResourceBlock __0, out ResourceBlock __state)
+        {
+            __state = __0;
+        }
+
+        private static void RepeatProductionBatch(ResourceProducer __instance, ResourceBlock __state)
+        {
+            ResourceTweaks mod = active;
+            if (replayingProduction || mod == null || !mod.yieldHookReady ||
+                !mod.productionYieldEnabled.Value || __instance == null) return;
+            int factor = Math.Max(1, Math.Min(25, mod.productionYieldMultiplier.Value));
+            if (factor <= 1 || producerProduceMethod == null) return;
+            replayingProduction = true;
+            try
+            {
+                for (int i = 1; i < factor; i++)
+                {
+                    producerProduceMethod.Invoke(__instance, new object[] { __state });
+                    mod.productionYieldCalls++;
+                }
+            }
+            catch (Exception ex)
+            {
+                if (!mod.warnedProductionReplay)
+                {
+                    mod.warnedProductionReplay = true;
+                    mod.Logger.LogWarning("PRODUCTION YIELD replay failed; check output/stock: " + ex.GetBaseException().Message);
+                }
+            }
+            finally { replayingProduction = false; }
+        }
+
+        // Production API discovery: deliberately read-only until exact output and
+        // timer hooks are identified. Never patch global StoreResources or worker
+        // efficiency: those would also alter consumption or unrelated systems.
+        private void ScanProductionAPI()
+        {
+            if (productionAuditWritten) return;
+            productionAuditWritten = true;
+            try
+            {
+                string[] targets = { "ResourceProducer", "BuildingProducer", "ProductionStats",
+                    "IWorkProducer", "IProductionRequirementProvider", "ProductionItemUI",
+                    "ResourceBuilding", "CityResourceManager", "ProductionIndicator",
+                    "WorkProvider", "Workplace", "WorkProvider+Data", "Workplace+Data", "ResourceBlock" };
+                int total = 0;
+                foreach (string typeName in targets)
+                {
+                    Type t = AccessTools.TypeByName(typeName);
+                    if (t == null) { Logger.LogInfo("PRODUCTION TYPE MISSING: " + typeName); continue; }
+                    Logger.LogInfo("PRODUCTION TYPE: " + t.FullName + " base=" + t.BaseType);
+                    foreach (FieldInfo f in t.GetFields(Flags))
+                    {
+                        if (f.IsStatic) continue;
+                        Logger.LogInfo("PRODUCTION FIELD: " + t.Name + "." + f.Name + " : " + f.FieldType);
+                    }
+                    foreach (PropertyInfo property in t.GetProperties(Flags))
+                    {
+                        if (property.GetIndexParameters().Length != 0) continue;
+                        Logger.LogInfo("PRODUCTION PROPERTY: " + t.Name + "." + property.Name + " : " + property.PropertyType);
+                    }
+                    foreach (MethodInfo m in t.GetMethods(Flags | BindingFlags.DeclaredOnly))
+                    {
+                        if (m.IsSpecialName && !m.Name.StartsWith("get_")) continue;
+                        Logger.LogInfo("PRODUCTION METHOD: " + t.Name + "." + m);
+                        total++;
+                    }
+                }
+                Logger.LogInfo("PRODUCTION API SCAN COMPLETE: " + total + " methods; read-only, no output or timing modified");
+            }
+            catch (Exception ex)
+            {
+                productionAuditWritten = false;
+                Logger.LogWarning("PRODUCTION API SCAN FAILED: " + ex.GetBaseException().Message);
+            }
+        }
+
+        private void DrawProductionTab()
+        {
+            GUI.Label(new Rect(19, 121, 520, 29), "PRODUCTION TWEAKS  /  GAME OVERRIDES", headingStyle);
+            GUI.Label(new Rect(19, 154, 522, 47),
+                "Independent output yield and cycle speed preferences.\n" +
+                "Yield: final output only. Speed: production-only work interval.", bodyStyle);
+            bool yield = productionYieldEnabled.Value;
+            bool oldYieldEnabled = yield, oldSpeedEnabled = productionSpeedEnabled.Value;
+            int oldYield = productionYieldMultiplier.Value, oldSpeed = productionSpeedMultiplier.Value;
+            bool speed = productionSpeedEnabled.Value;
+            GUI.Label(new Rect(23, 209, 330, 29), "Production Yield", bodyStyle);
+            if (GUI.Button(new Rect(413, 207, 128, 30), yield ? "ON [X]" : "OFF", yield ? primaryStyle : buttonStyle)) yield = !yield;
+            GUI.Label(new Rect(23, 252, 330, 29), "Production Speed", bodyStyle);
+            if (GUI.Button(new Rect(413, 250, 128, 30), speed ? "ON [X]" : "OFF", speed ? primaryStyle : buttonStyle)) speed = !speed;
+            GUI.Label(new Rect(23, 296, 110, 24), "Yield / Speed", mutedStyle);
+            int[] choices = { 1, 2, 5, 10, 25 };
+            for (int i = 0; i < choices.Length; i++)
+            {
+                int multiplier = choices[i];
+                float x = 175 + i * 73;
+                if (GUI.Button(new Rect(x, 293, 67, 26), multiplier + "x", productionYieldMultiplier.Value == multiplier ? primaryStyle : presetStyle))
+                    productionYieldMultiplier.Value = multiplier;
+                if (GUI.Button(new Rect(x, 326, 67, 26), multiplier + "x", productionSpeedMultiplier.Value == multiplier ? primaryStyle : presetStyle))
+                    productionSpeedMultiplier.Value = multiplier;
+            }
+            GUI.Label(new Rect(23, 325, 145, 26), "Speed presets", mutedStyle);
+            if (yield != productionYieldEnabled.Value || speed != productionSpeedEnabled.Value)
+            {
+                productionYieldEnabled.Value = yield;
+                productionSpeedEnabled.Value = speed;
+            }
+            if (oldYield != productionYieldMultiplier.Value || oldSpeed != productionSpeedMultiplier.Value ||
+                yield != oldYieldEnabled || speed != oldSpeedEnabled)
+            {
+                try { Config.Save(); } catch (Exception ex) { Logger.LogWarning("PRODUCTION SETTINGS SAVE FAILED: " + ex.Message); }
+            }
+            if (GUI.Button(new Rect(19, 369, 526, 40), "SCAN PRODUCTION API / WRITE LOG", primaryStyle))
+            {
+                productionAuditWritten = false;
+                ScanProductionAPI();
+            }
+            GUI.DrawTexture(new Rect(18, 422, 528, 1), borderTex);
+            GUI.Label(new Rect(19, 430, 526, 62),
+                "v0.8.3.1 production hooks: yield=" + (yieldHookReady ? "READY" : "UNAVAILABLE") +
+                " speed=" + (speedHookReady ? "READY" : "UNAVAILABLE") + "\n" +
+                "Applied calls (since load): yield=" + productionYieldCalls + " speed=" + productionSpeedCalls + "\n" +
+                "Use backup saves; report output amounts and cycle times.", mutedStyle);
+        }
+
         private void DrawResearchTab()
         {
             GUI.Label(new Rect(19, 121, 520, 29), "RESEARCH TWEAKS  /  GAME OVERRIDES", headingStyle);
@@ -1455,7 +1698,7 @@ namespace Sarakiel.AllWillFall
             }
             GUI.DrawTexture(new Rect(18, 387, 528, 1), borderTex);
             GUI.Label(new Rect(19, 399, 526, 81),
-                "RESEARCH v0.7.2  —  direct research hooks.\n" +
+                "RESEARCH v0.8.1  —  direct research hooks.\n" +
                 "Independent ON/OFF settings are saved automatically.\n" +
                 "Test on a backup save; report any incomplete unlocks.", mutedStyle);
         }
