@@ -1,1 +1,9 @@
-Double-click `build.cmd` to build, `install.cmd` to build/install, `release.cmd` to create a distributable ZIP. Game defaults to `C:\Games\All Will Fall`.
+# Development workflow
+
+1. `build.cmd` — compile from `src` using installed game/BepInEx references.
+2. `install.cmd` — build and install to `C:\Games\All Will Fall\BepInEx\plugins`.
+3. Test on a backup save (F8).
+4. `release.cmd` — produce release archive.
+5. `uninstall.cmd` — remove installed plugin.
+
+Inspect `CAPACITY APPLY` / `CAPACITY OWNER` when diagnosing storage.

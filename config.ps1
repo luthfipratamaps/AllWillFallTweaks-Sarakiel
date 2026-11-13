@@ -2,4 +2,4 @@
 $GameDir   = 'C:\Games\All Will Fall'
 $PluginDir = 'C:\Games\All Will Fall\BepInEx\plugins'
 $ModName   = 'AllWillFallTweaks'
-$Version   = '0.3.2'
+$Version   = '0.4.5'

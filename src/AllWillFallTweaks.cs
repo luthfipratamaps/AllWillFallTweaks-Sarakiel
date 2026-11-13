@@ -10,19 +10,24 @@ using UnityEngine;
 
 namespace Sarakiel.AllWillFall
 {
-    [BepInPlugin("id.sarakiel.allwillfall.resourcetweaks", "All Will Fall - Resource Tweaks", "0.3.2")]
+    [BepInPlugin("id.sarakiel.allwillfall.resourcetweaks", "All Will Fall - Resource Tweaks", "0.4.5")]
     public class ResourceTweaks : BaseUnityPlugin
     {
         private readonly string[] names = { "Water", "Food", "Junk", "Wood", "Metal", "Sand", "Fuel", "Goods", "Tools" };
         private bool visible;
         private string amountText = "1000";
         private string status = "Press F8 to open";
-        private Rect window = new Rect(110, 90, 564, 458);
+        private Rect window = new Rect(110, 90, 564, 505);
         private ConfigEntry<float> savedX, savedY;
         private ConfigEntry<KeyCode> toggleKey;
         private ConfigEntry<int> defaultAmount;
         private ConfigEntry<bool> strictMouseBlock;
         private ConfigEntry<bool> newInputSystemBlock;
+        private ConfigEntry<int> storageMultiplier, housingMultiplier;
+        private ConfigEntry<bool> enableWater, enableFood, enableFuel, enableWarehouse, enableHouse;
+        private bool capacityTab;
+        private readonly List<string> capacityDiagnostics = new List<string>();
+        private int capacityPatched;
         private int inputMethodsPatched;
         private Harmony harmony;
         private GUIStyle panelStyle, headingStyle, subtitleStyle, mutedStyle, bodyStyle, numberStyle, inputStyle, buttonStyle, presetStyle, primaryStyle, cardStyle, closeStyle;
@@ -48,6 +53,13 @@ namespace Sarakiel.AllWillFall
             defaultAmount = Config.Bind("Resources", "DefaultAmount", 1000, "Starting amount for a new session");
             strictMouseBlock = Config.Bind("Input", "BlockWorldMouseWhileMenuOpen", true, "Experimental: suppress legacy Unity mouse button polling whenever the tweak window is open. Turn off if incompatible.");
             newInputSystemBlock = Config.Bind("Input", "BlockNewInputSystemWhileMenuOpen", true, "Suppress newer Unity Input System mouse buttons and actions while the tweak menu is open. Disable if incompatible.");
+            storageMultiplier = Config.Bind("Capacity", "StorageMultiplier", 10, "Storage building capacity multiplier (1-100). Calculated from the original getter capacity, not saved to assets.");
+            housingMultiplier = Config.Bind("Capacity", "HousingMultiplier", 5, "Housing building capacity multiplier (1-20). Applied by safe getter patch.");
+            enableWater = Config.Bind("Capacity", "WaterStorage", true, "Enable water storage building multiplier");
+            enableFood = Config.Bind("Capacity", "FoodWarehouse", true, "Enable food warehouse multiplier");
+            enableFuel = Config.Bind("Capacity", "FuelWarehouse", true, "Enable fuel warehouse multiplier");
+            enableWarehouse = Config.Bind("Capacity", "GeneralWarehouse", true, "Enable general warehouse multiplier");
+            enableHouse = Config.Bind("Capacity", "Housing", true, "Enable house occupancy multiplier");
             amountText = Math.Max(1, Math.Min(1000000, defaultAmount.Value)).ToString();
             window.x = Mathf.Clamp(savedX.Value, 0, Mathf.Max(0, Screen.width - window.width));
             window.y = Mathf.Clamp(savedY.Value, 0, Mathf.Max(0, Screen.height - window.height));
@@ -75,6 +87,8 @@ namespace Sarakiel.AllWillFall
             catch (Exception ex) { Logger.LogWarning("Optional UI pointer guard could not initialize: " + ex.Message); }
             InstallStrictMouseGuard();
             InstallNewInputGuard();
+            InstallCapacityPatches();
+            ScanStorageInstances(true);
         }
 
         // IMGUI uses Event.current, while many games poll UnityEngine.Input separately.
@@ -194,6 +208,11 @@ namespace Sarakiel.AllWillFall
 
         private void Update()
         {
+            if (capacityPatched > 0)
+            {
+                ScanStorageInstances(false);
+                ApplyStorageCapacities();
+            }
             if (Input.GetKeyDown(toggleKey != null ? toggleKey.Value : KeyCode.F8))
             {
                 visible = !visible;
@@ -302,23 +321,26 @@ namespace Sarakiel.AllWillFall
         {
             GUI.DrawTexture(new Rect(0, 0, 564, 4), primaryTex);
             GUI.Label(new Rect(19, 14, 400, 29), "ALL WILL FALL  /  TWEAKS", headingStyle);
-            GUI.Label(new Rect(22, 42, 350, 17), "SARAKIEL  •  RESOURCE DASHBOARD   v0.3.2", subtitleStyle);
+            GUI.Label(new Rect(22, 42, 450, 17), "SARAKIEL  •  TWEAKS DASHBOARD   v0.4.5", subtitleStyle);
             if (GUI.Button(new Rect(516, 18, 30, 28), "×", closeStyle)) { visible = false; pointerCaptured = false; SaveWindowPosition(); }
             GUI.DrawTexture(new Rect(18, 69, 528, 1), borderTex);
+            if (GUI.Button(new Rect(18, 77, 259, 30), "RESOURCES", capacityTab ? buttonStyle : primaryStyle)) capacityTab = false;
+            if (GUI.Button(new Rect(286, 77, 260, 30), "BUILDING CAPACITY", capacityTab ? primaryStyle : buttonStyle)) capacityTab = true;
+            if (capacityTab) { DrawCapacityTab(); GUI.DragWindow(new Rect(0, 5, 500, 65)); return; }
 
-            GUI.Label(new Rect(19, 83, 85, 24), "ADD AMOUNT", mutedStyle);
-            amountText = GUI.TextField(new Rect(113, 82, 133, 31), amountText, 8, inputStyle);
+            GUI.Label(new Rect(19, 118, 85, 24), "ADD AMOUNT", mutedStyle);
+            amountText = GUI.TextField(new Rect(113, 117, 133, 31), amountText, 8, inputStyle);
             int[] presets = { 1, 10, 100, 1000 };
             for (int i=0; i<presets.Length; i++)
-                if (GUI.Button(new Rect(258 + i*72, 82, 65, 31), presets[i].ToString(), presetStyle)) amountText = presets[i].ToString();
+                if (GUI.Button(new Rect(258 + i*72, 117, 65, 31), presets[i].ToString(), presetStyle)) amountText = presets[i].ToString();
 
-            GUI.Label(new Rect(19, 124, 300, 21), "RESOURCES", headingStyle);
-            GUI.Label(new Rect(418, 125, 125, 20), "CURRENT STOCK", mutedStyle);
+            GUI.Label(new Rect(19, 159, 300, 21), "RESOURCES", headingStyle);
+            GUI.Label(new Rect(418, 160, 125, 20), "CURRENT STOCK", mutedStyle);
             for (int i=0; i<names.Length; i++)
             {
                 int col = i%3, row = i/3;
                 float x = 18 + col*179;
-                float y = 151 + row*64;
+                float y = 151 + row*64 + 35;
                 GUI.DrawTexture(new Rect(x,y,170,57), cardTex);
                 string label = names[i];
                 GUI.Label(new Rect(x+9,y+5,95,21),label,bodyStyle);
@@ -328,17 +350,276 @@ namespace Sarakiel.AllWillFall
                 if (GUI.Button(new Rect(x+8,y+30,154,22),"+  ADD " + label.ToUpperInvariant(), buttonStyle)) Add(label);
             }
             if (Time.realtimeSinceStartup - lastCountRefresh > 0.9f) RefreshCounts();
-            if (GUI.Button(new Rect(18, 360, 367, 38), "＋  ADD ALL NINE RESOURCES", primaryStyle))
+            if (GUI.Button(new Rect(18, 395, 367, 38), "＋  ADD ALL NINE RESOURCES", primaryStyle))
             {
                 foreach (string name in names) Add(name);
                 status = "All resource additions requested (see log for results)";
                 RefreshCounts();
             }
-            if (GUI.Button(new Rect(394, 360, 152, 38), "⟳  RESCAN", buttonStyle))
+            if (GUI.Button(new Rect(394, 395, 152, 38), "⟳  RESCAN", buttonStyle))
             { inspected = false; manager = null; counts.Clear(); LocateManager(); RefreshCounts(); }
-            GUI.DrawTexture(new Rect(18, 410, 528, 1), borderTex);
-            GUI.Label(new Rect(19, 416, 524, 32), status, mutedStyle);
+            GUI.DrawTexture(new Rect(18, 445, 528, 1), borderTex);
+            GUI.Label(new Rect(19, 451, 524, 32), status, mutedStyle);
             GUI.DragWindow(new Rect(0, 5, 500, 65));
+        }
+
+
+        // Exact capacity getters discovered in v0.4.1 runtime diagnostics.
+        // Patch return values rather than writing game asset fields (prevents compounding).
+        private void InstallCapacityPatches()
+        {
+            if (harmony == null) harmony = new Harmony("id.sarakiel.allwillfall.resourcetweaks.ui");
+            Assembly game = AppDomain.CurrentDomain.GetAssemblies().FirstOrDefault(a => a.GetName().Name == "ScriptsAssembly");
+            if (game == null) { Logger.LogWarning("CAPACITY: ScriptsAssembly is not loaded"); return; }
+            foreach (string fullName in new[] { "Storage", "House" })
+            {
+                Type t = game.GetType(fullName, false);
+                if (t == null) { Logger.LogWarning("CAPACITY: type unavailable " + fullName); continue; }
+                MethodInfo getter = t.GetMethod("get_Capacity", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly, null, Type.EmptyTypes, null);
+                if (getter == null || getter.ReturnType != typeof(int)) { Logger.LogWarning("CAPACITY: int getter unavailable " + fullName); continue; }
+                try
+                {
+                    MethodInfo postfix = typeof(ResourceTweaks).GetMethod(fullName == "House" ? "HouseCapacityPostfix" : "StorageCapacityPostfix", BindingFlags.Static | BindingFlags.NonPublic);
+                    harmony.Patch(getter, postfix: new HarmonyMethod(postfix));
+                    capacityPatched++;
+                    Logger.LogInfo("CAPACITY PATCH: " + t.FullName + ".get_Capacity -> " + postfix.Name);
+                }
+                catch (Exception e) { Logger.LogWarning("CAPACITY PATCH FAILED: " + fullName + " " + e); }
+            }
+            Logger.LogInfo("CAPACITY: " + capacityPatched + "/2 exact getters patched. Verify actual simulation on backup save.");
+        }
+
+        private static void HouseCapacityPostfix(ref int __result)
+        {
+            if (active == null || !active.enableHouse.Value || __result <= 0) return;
+            int factor = Mathf.Clamp(active.housingMultiplier.Value, 1, 20);
+            __result = MultiplySafe(__result, factor);
+        }
+
+        private readonly HashSet<object> tracedStorage = new HashSet<object>(ReferenceEqualityComparer.Instance);
+        private readonly HashSet<object> tracedUnknown = new HashSet<object>(ReferenceEqualityComparer.Instance);
+        private static void StorageCapacityPostfix(object __instance, ref int __result)
+        {
+            if (active == null || __instance == null || __result <= 0) return;
+            int factor = Mathf.Clamp(active.storageMultiplier.Value, 1, 100);
+            string kind = active.ResolveStorageKind(__instance);
+            bool enabled = kind == "water" ? active.enableWater.Value :
+                kind == "food" ? active.enableFood.Value :
+                kind == "fuel" ? active.enableFuel.Value :
+                kind == "warehouse" ? active.enableWarehouse.Value : false;
+            if (active.tracedStorage.Add(__instance) && active.tracedStorage.Count <= 48)
+            {
+                int raw = -1;
+                try { var f = __instance.GetType().GetField("capacity", Flags); if (f != null) raw = (int)f.GetValue(__instance); } catch { }
+                active.Logger.LogInfo("CAPACITY TRACE: kind=" + (kind.Length == 0 ? "UNKNOWN" : kind) +
+                    " enabled=" + enabled + " getterBase=" + __result + " rawField=" + raw +
+                    " multiplier=" + factor + " storageHash=" + System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(__instance));
+            }
+            if (!enabled)
+            {
+                int baseCapacity;
+                if (active.storageBaseCapacities.TryGetValue(__instance, out baseCapacity)) __result = baseCapacity;
+                return;
+            }
+            // Calculate from the original getter result. Do NOT write back into the
+            // serialized backing field, so config changes never compound capacity.
+            int original;
+            if (!active.storageBaseCapacities.TryGetValue(__instance, out original)) original = __result;
+            __result = MultiplySafe(original, factor);
+        }
+
+        private static int MultiplySafe(int original, int factor)
+        {
+            return factor <= 1 ? original : (original > int.MaxValue / factor ? int.MaxValue : original * factor);
+        }
+
+        private string ResolveStorageKind(object targetStorage)
+        {
+            string kind;
+            if (storageKinds.TryGetValue(targetStorage, out kind)) return kind;
+            // Refresh only after a missed lookup. Harmony patches may execute often.
+            ScanStorageInstances(false);
+            if (storageKinds.TryGetValue(targetStorage, out kind)) return kind;
+            if (unknownStorageLogged.Add(targetStorage) && unknownStorageLogged.Count <= 12)
+            {
+                Logger.LogWarning("CAPACITY UNKNOWN STORAGE: " + targetStorage.GetType().FullName +
+                    ". No building owner matched; original capacity kept.");
+            }
+            return "";
+        }
+
+        private bool capacityLookupWarningWritten;
+        private readonly Dictionary<object, string> storageKinds = new Dictionary<object, string>(ReferenceEqualityComparer.Instance);
+        private readonly Dictionary<object, int> storageBaseCapacities = new Dictionary<object, int>(ReferenceEqualityComparer.Instance);
+        private readonly HashSet<object> unknownStorageLogged = new HashSet<object>(ReferenceEqualityComparer.Instance);
+        private float lastStorageScan;
+        private bool capacityScanBusy;
+        private sealed class ReferenceEqualityComparer : IEqualityComparer<object>
+        {
+            public static readonly ReferenceEqualityComparer Instance = new ReferenceEqualityComparer();
+            public new bool Equals(object a, object b) { return object.ReferenceEquals(a,b); }
+            public int GetHashCode(object x) { return System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(x); }
+        }
+        private void ScanStorageInstances(bool force)
+        {
+            if (capacityScanBusy) return;
+            if (!force && Time.unscaledTime - lastStorageScan < 0.6f) return;
+            lastStorageScan = Time.unscaledTime;
+            capacityScanBusy = true;
+            try
+            {
+                // ResourceBuilding is a Unity component. Scan live objects, not only the
+                // CityResourceManager registry (which may omit some buildings).
+                Type rbType = AccessTools.TypeByName("ResourceBuilding");
+                if (rbType != null && typeof(UnityEngine.Object).IsAssignableFrom(rbType))
+                {
+                    foreach (UnityEngine.Object rb in Resources.FindObjectsOfTypeAll(rbType))
+                    {
+                        if (rb == null) continue;
+                        Component component = rb as Component;
+                        if (component != null && !component.gameObject.scene.IsValid()) continue;
+                        RegisterStorage(rb, null);
+                    }
+                }
+                if (manager == null) LocateManager();
+                if (manager != null)
+                {
+                    FieldInfo f = manager.GetType().GetField("resourceBuildings", Flags);
+                    IDictionary map = f == null ? null : f.GetValue(manager) as IDictionary;
+                    if (map != null) foreach (DictionaryEntry item in map) RegisterStorage(item.Value, item.Key);
+                }
+            }
+            catch (Exception ex)
+            {
+                if (!capacityLookupWarningWritten) { capacityLookupWarningWritten = true; Logger.LogWarning("CAPACITY SCAN: " + ex); }
+            }
+            finally { capacityScanBusy = false; }
+        }
+        private void RegisterStorage(object resourceBuilding, object buildable)
+        {
+            if (resourceBuilding == null) return;
+            FieldInfo sf = resourceBuilding.GetType().GetField("storage", Flags);
+            object storage = sf == null ? null : sf.GetValue(resourceBuilding);
+            if (storage == null) return;
+            string id = (DescribeBuildable(buildable) + " " + DescribeBuildable(resourceBuilding)).ToLowerInvariant();
+            var component = resourceBuilding as Component;
+            if (component != null)
+            {
+                id += " " + component.gameObject.name.ToLowerInvariant();
+                // Some names are stored on the parent Buildable rather than this component.
+                Transform tr = component.transform;
+                for (int i=0; tr != null && i<3; i++, tr=tr.parent) id += " " + tr.name.ToLowerInvariant();
+            }
+            string kind = id.Contains("water") ? "water" :
+                id.Contains("food") ? "food" :
+                id.Contains("fuel") ? "fuel" :
+                (id.Contains("warehouse") || id.Contains("storage")) ? "warehouse" : "";
+            if (kind.Length == 0) return;
+            if (!storageKinds.ContainsKey(storage) || kind != "warehouse")
+            {
+                bool changed = !storageKinds.ContainsKey(storage) || storageKinds[storage] != kind;
+                storageKinds[storage] = kind;
+                if (changed) Logger.LogInfo("CAPACITY OWNER: " + kind + " storageHash=" +
+                    System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(storage) + " : " + id.Substring(0, Math.Min(125,id.Length)));
+            }
+            if (!storageBaseCapacities.ContainsKey(storage))
+            {
+                // Read raw backing capacity, never the patched getter.
+                FieldInfo cf = storage.GetType().GetField("capacity", Flags);
+                if (cf != null && cf.FieldType == typeof(int))
+                {
+                    int original = (int)cf.GetValue(storage);
+                    if (original > 0) storageBaseCapacities[storage] = original;
+                }
+            }
+        }
+        // The game sometimes caches storage capacity before our ownership lookup has
+        // completed. Updating the actual Storage.capacity field also makes the stock UI
+        // and fullness bar use a consistent denominator, instead of only patching a getter.
+        // Base values are stored separately: changing 10x to 5x never compounds.
+        private float nextCapacityApply;
+        private readonly HashSet<object> appliedCapacityLog = new HashSet<object>(ReferenceEqualityComparer.Instance);
+        private void ApplyStorageCapacities()
+        {
+            if (Time.unscaledTime < nextCapacityApply) return;
+            nextCapacityApply = Time.unscaledTime + 0.65f;
+            foreach (var entry in storageKinds.ToArray())
+            {
+                object storage = entry.Key;
+                if (storage == null) continue;
+                int original;
+                if (!storageBaseCapacities.TryGetValue(storage, out original) || original <= 0) continue;
+                bool enabled = entry.Value == "water" ? enableWater.Value :
+                    entry.Value == "food" ? enableFood.Value :
+                    entry.Value == "fuel" ? enableFuel.Value :
+                    entry.Value == "warehouse" ? enableWarehouse.Value : false;
+                int multiplier = enabled ? Mathf.Clamp(storageMultiplier.Value, 1, 100) : 1;
+                int desired = MultiplySafe(original, multiplier);
+                try
+                {
+                    FieldInfo field = storage.GetType().GetField("capacity", Flags);
+                    if (field == null || field.FieldType != typeof(int)) continue;
+                    int current = (int)field.GetValue(storage);
+                    if (current == desired) continue;
+                    field.SetValue(storage, desired);
+                    if (appliedCapacityLog.Add(storage))
+                        Logger.LogInfo("CAPACITY APPLY: " + entry.Value + " base=" + original +
+                            " multiplier=" + multiplier + " current=" + current + " new=" + desired);
+                }
+                catch (Exception ex)
+                {
+                    if (appliedCapacityLog.Add(storage)) Logger.LogWarning("CAPACITY APPLY FAILED: " + entry.Value + " " + ex.Message);
+                }
+            }
+        }
+
+        private static string DescribeBuildable(object obj)
+        {
+            if (obj == null) return "";
+            List<string> identifiers = new List<string>();
+            var unityObject = obj as UnityEngine.Object;
+            if (unityObject != null) identifiers.Add(unityObject.name ?? "");
+            Type type = obj.GetType();
+            identifiers.Add(type.Name);
+            foreach (string name in new[] { "name", "title", "Title", "PrettyTitle", "ID", "Id", "Name", "buildable", "Buildable" })
+            {
+                try
+                {
+                    FieldInfo field = type.GetField(name, Flags);
+                    object value = field != null ? field.GetValue(obj) : null;
+                    if (field == null)
+                    {
+                        PropertyInfo property = type.GetProperty(name, Flags);
+                        if (property != null && property.GetIndexParameters().Length == 0) value = property.GetValue(obj, null);
+                    }
+                    if (value is string) identifiers.Add((string)value);
+                    else if (value is UnityEngine.Object) identifiers.Add(((UnityEngine.Object)value).name ?? "");
+                }
+                catch { }
+            }
+            return String.Join(" ", identifiers.ToArray());
+        }
+
+        private void DrawCapacityTab()
+        {
+            GUI.Label(new Rect(19, 120, 515, 26), "BUILDING CAPACITY MULTIPLIERS", headingStyle);
+            GUI.Label(new Rect(19, 152, 430, 23), "Storage multiplier: " + Mathf.Clamp(storageMultiplier.Value, 1, 100) + "x", bodyStyle);
+            int[] storageValues = { 1, 2, 5, 10, 25, 50 };
+            for (int i=0;i<storageValues.Length;i++)
+                if (GUI.Button(new Rect(19 + i*88, 183, 81, 31), storageValues[i] + "x", storageMultiplier.Value == storageValues[i] ? primaryStyle : presetStyle)) storageMultiplier.Value = storageValues[i];
+            GUI.Label(new Rect(19, 228, 430, 23), "Housing multiplier: " + Mathf.Clamp(housingMultiplier.Value, 1, 20) + "x", bodyStyle);
+            int[] housingValues = { 1, 2, 3, 5, 10, 20 };
+            for (int i=0;i<housingValues.Length;i++)
+                if (GUI.Button(new Rect(19 + i*88, 259, 81, 31), housingValues[i] + "x", housingMultiplier.Value == housingValues[i] ? primaryStyle : presetStyle)) housingMultiplier.Value = housingValues[i];
+            GUI.Label(new Rect(19, 304, 400, 22), "ENABLED BUILDING TYPES", headingStyle);
+            enableWater.Value = GUI.Toggle(new Rect(20, 335, 165, 24), enableWater.Value, "Water storage", bodyStyle);
+            enableFood.Value = GUI.Toggle(new Rect(193, 335, 165, 24), enableFood.Value, "Food warehouse", bodyStyle);
+            enableFuel.Value = GUI.Toggle(new Rect(365, 335, 165, 24), enableFuel.Value, "Fuel warehouse", bodyStyle);
+            enableWarehouse.Value = GUI.Toggle(new Rect(20, 370, 245, 24), enableWarehouse.Value, "General warehouse", bodyStyle);
+            enableHouse.Value = GUI.Toggle(new Rect(280, 370, 245, 24), enableHouse.Value, "Houses", bodyStyle);
+            GUI.DrawTexture(new Rect(18, 414, 528, 1), borderTex);
+            GUI.Label(new Rect(20, 420, 525, 52), "Capacity patches: " + capacityPatched + " | tracked storages: " + storageKinds.Count +
+                "\nCheck CAPACITY TRACE/OWNER in LogOutput.log. Slider fill may still use base capacity.", mutedStyle);
         }
 
         private void RefreshCounts()
