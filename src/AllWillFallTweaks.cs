@@ -12,7 +12,7 @@ using UnityEngine.SceneManagement;
 
 namespace Sarakiel.AllWillFall
 {
-    [BepInPlugin("id.sarakiel.allwillfall.resourcetweaks", "All Will Fall - Resource Tweaks", "0.10.1")]
+    [BepInPlugin("id.sarakiel.allwillfall.resourcetweaks", "All Will Fall - Resource Tweaks", "0.11.5")]
     public class ResourceTweaks : BaseUnityPlugin
     {
         private readonly string[] names = { "Water", "Food", "Junk", "Wood", "Metal", "Sand", "Fuel", "Goods", "Tools" };
@@ -26,6 +26,11 @@ namespace Sarakiel.AllWillFall
         private ConfigEntry<bool> strictMouseBlock;
         private ConfigEntry<bool> newInputSystemBlock;
         private ConfigEntry<int> storageMultiplier, housingMultiplier;
+        private ConfigEntry<bool> enableBattery;
+        private ConfigEntry<int> batteryCapacityMultiplier;
+        private int lastBatteryMultiplier;
+        private bool lastBatteryEnabled;
+        private bool batteryGetterHookReady;
         private ConfigEntry<bool> enableWater, enableFood, enableFuel, enableWarehouse, enableHouse;
         private bool capacityTab;
         private bool constructionTab;
@@ -33,6 +38,17 @@ namespace Sarakiel.AllWillFall
         private bool productionTab;
         private bool citizenTab;
         private bool weatherTab;
+        private bool structuralTab;
+        private bool structuralInspected;
+        // Per-session cache of original ScriptableObject values. Reversible on toggle.
+        private readonly Dictionary<object, long> originalLinkStrength = new Dictionary<object, long>();
+        private FieldInfo linkStrengthField;
+        private int strengthAssetsDiscovered;
+        private int appliedStructuralMultiplier = -1;
+        private bool appliedStructuralEnabled;
+        private bool structuralCollapseHookInstalled;
+        private ConfigEntry<bool> structuralStrengthEnabled, structuralPreventOverload;
+        private ConfigEntry<int> structuralStrengthMultiplier;
         private bool weatherApiInspected;
         private bool weatherApiPending = true;
         private static MethodInfo weatherSeaDeltaMethod;
@@ -78,6 +94,7 @@ namespace Sarakiel.AllWillFall
         private static MethodInfo producerProduceMethod;
         private static bool replayingProduction;
         private bool yieldHookReady, speedHookReady;
+        private bool electricityYieldHookReady;
         private readonly Dictionary<object, bool> resourceWorkProviderCache = new Dictionary<object, bool>(ReferenceEqualityComparer.Instance);
         private static FieldInfo workProviderProducersField;
         private bool warnedSpeedProviderRead;
@@ -131,6 +148,8 @@ namespace Sarakiel.AllWillFall
             lastFoodEnabled = enableFood.Value;
             lastFuelEnabled = enableFuel.Value;
             lastWarehouseEnabled = enableWarehouse.Value;
+            lastBatteryEnabled = enableBattery.Value;
+            lastBatteryMultiplier = batteryCapacityMultiplier.Value;
         }
 
         private void DetectCapacitySettingsChange()
@@ -139,7 +158,9 @@ namespace Sarakiel.AllWillFall
                 enableWater.Value == lastWaterEnabled &&
                 enableFood.Value == lastFoodEnabled &&
                 enableFuel.Value == lastFuelEnabled &&
-                enableWarehouse.Value == lastWarehouseEnabled) return;
+                enableWarehouse.Value == lastWarehouseEnabled &&
+                enableBattery.Value == lastBatteryEnabled &&
+                batteryCapacityMultiplier.Value == lastBatteryMultiplier) return;
             RememberCapacitySettings();
             capacitySettingsDirty = true;
         }
@@ -159,7 +180,7 @@ namespace Sarakiel.AllWillFall
         private readonly Dictionary<string, string> counts = new Dictionary<string, string>();
         private static ResourceTweaks active;
         private const int WindowId = 98311;
-        private static readonly string[] tabLabels = { "ITEMS", "CAPACITY", "BUILD", "RESEARCH", "OUTPUT", "CITIZENS", "WEATHER" };
+        private static readonly string[] tabLabels = { "ITEMS", "CAP", "BUILD", "TECH", "OUTPUT", "CREW", "WEATHER", "STRUCT" };
         private Type managerType;
         private object manager;
         private bool inspected;
@@ -182,6 +203,8 @@ namespace Sarakiel.AllWillFall
             enableFuel = Config.Bind("Capacity", "FuelWarehouse", true, "Enable fuel warehouse multiplier");
             enableWarehouse = Config.Bind("Capacity", "GeneralWarehouse", true, "Enable general warehouse multiplier");
             enableHouse = Config.Bind("Capacity", "Housing", true, "Enable house occupancy multiplier");
+            enableBattery = Config.Bind("Capacity", "BatteryCapacityEnabled", true, "Battery electricity storage capacity multiplier (independent of warehouses).");
+            batteryCapacityMultiplier = Config.Bind("Capacity", "BatteryCapacityMultiplier", 10, "Battery capacity: 1x, 10x, 100x, or 1000x. Changes affect electricity storage only.");
             autoScanEnabled = Config.Bind("Startup", "AutoScanOnCityLoad", true, "Automatically discover storage buildings when a city loads. Manual Refresh is available.");
             autoScanInterval = Config.Bind("Startup", "BackgroundScanIntervalSeconds", 5f, "Lightweight registry update interval; a full scene scan runs once at city initialization.");
             verboseDiagnostics = Config.Bind("Diagnostics", "VerboseLogging", false, "Log resource reflection details, per-storage traces and scan attempts for troubleshooting.");
@@ -233,6 +256,9 @@ namespace Sarakiel.AllWillFall
             weatherRainIntensity = Config.Bind("Weather", "RainIntensity", 1f, "Multiplies native WeatherSegment raininess (0, 1, 2).");
             weatherStormsDisabled = Config.Bind("Weather", "DisableStorms", false, "Suppress wind and weather-related physics stress; does not rewrite forecasts.");
             weatherPreset = Config.Bind("Weather", "Preset", "Default", "Override weather parameters using compatible WeatherSegment getters; does not rewrite forecast blocks.");
+            structuralStrengthEnabled = Config.Bind("Structural", "StrengthEnabled", false, "Multiply source StressParameters.LinkStrength before it enters physics jobs. Assets are restored when disabled.");
+            structuralStrengthMultiplier = Config.Bind("Structural", "StrengthMultiplier", 5, "Structural connection strength (1, 2, 5, 10, 25, 50). Existing stress buffers may need rebuilding.");
+            structuralPreventOverload = Config.Bind("Structural", "PreventOverloadCollapse", false, "Override StressLayer.get_Collapses structural overload result only. General Collapser.Collapse stays vanilla.");
             amountText = Math.Max(1, Math.Min(1000000, defaultAmount.Value)).ToString();
             window.x = Mathf.Clamp(savedX.Value, 0, Mathf.Max(0, Screen.width - window.width));
             window.y = Mathf.Clamp(savedY.Value, 0, Mathf.Max(0, Screen.height - window.height));
@@ -261,6 +287,7 @@ namespace Sarakiel.AllWillFall
             InstallStrictMouseGuard();
             InstallNewInputGuard();
             InstallCapacityPatches();
+            InstallBatteryCapacityPatch();
             InstallConstructionOverrides();
             InstallConstructionDirectPatches();
             InstallResearchHooks();
@@ -434,6 +461,10 @@ namespace Sarakiel.AllWillFall
                 diagnosticsWritten = false;
                 lastManagerReady = false;
                 weatherApiInspected = false;
+                RestoreStructuralStrength();
+                structuralInspected = false;
+                strengthAssetsDiscovered = 0;
+                appliedStructuralMultiplier = -1;
                 weatherApiPending = true;
                 weatherApiStatus = "Waiting for city...";
                 weatherSeaDeltaOwner = null;
@@ -477,10 +508,12 @@ namespace Sarakiel.AllWillFall
                 lastManagerReady = ready;
                 if (ready) ScanStorageInstances(initialCityScan);
                 if (ready && !weatherApiInspected) InspectWeatherApiOnce();
+                if (ready && !structuralInspected) InspectStructuralApiOnce();
+                if (ready && structuralInspected) UpdateStructuralStrengthAssets(false);
                 ApplyStorageCapacities();
                 // Resource count discovery is expensive; the counts aren't visible
                 // while F8 is closed. Refresh only when the Resources tab is shown.
-                if (ready && visible && !capacityTab && !constructionTab && !researchTab && !productionTab && !citizenTab && !weatherTab)
+                if (ready && visible && !capacityTab && !constructionTab && !researchTab && !productionTab && !citizenTab && !weatherTab && !structuralTab)
                 {
                     RefreshCounts();
                 }
@@ -533,7 +566,17 @@ namespace Sarakiel.AllWillFall
             resourceRefreshRuns = 0; maxResourceRefreshMs = 0;
         }
 
-        private void OnDisable() { SaveWindowPosition(); if (active == this) active = null; if (harmony != null) harmony.UnpatchSelf(); }
+        private void OnDisable()
+        {
+            SaveWindowPosition();
+            RestoreStructuralStrength();
+            if (active == this) active = null;
+            if (harmony != null) harmony.UnpatchSelf();
+            structuralCollapseHookInstalled = false;
+            structuralInspected = false;
+            appliedStructuralEnabled = false;
+            appliedStructuralMultiplier = -1;
+        }
 
         private void SaveWindowPosition()
         {
@@ -636,17 +679,17 @@ namespace Sarakiel.AllWillFall
         {
             GUI.DrawTexture(new Rect(0, 0, 564, 4), primaryTex);
             GUI.Label(new Rect(19, 14, 400, 29), "ALL WILL FALL  /  TWEAKS", headingStyle);
-            GUI.Label(new Rect(22, 42, 450, 17), "SARAKIEL  •  TWEAKS   v0.10.0", subtitleStyle);
+            GUI.Label(new Rect(22, 42, 450, 17), "SARAKIEL  •  TWEAKS   v0.11.4", subtitleStyle);
             if (GUI.Button(new Rect(516, 18, 30, 28), "×", closeStyle)) { visible = false; pointerCaptured = false; SaveWindowPosition(); }
             GUI.DrawTexture(new Rect(18, 69, 528, 1), borderTex);
             // Seven tabs; fixed positions and no per-frame tab-label allocations.
-            int selected = weatherTab ? 6 : citizenTab ? 5 : productionTab ? 4 : researchTab ? 3 : constructionTab ? 2 : capacityTab ? 1 : 0;
+            int selected = structuralTab ? 7 : weatherTab ? 6 : citizenTab ? 5 : productionTab ? 4 : researchTab ? 3 : constructionTab ? 2 : capacityTab ? 1 : 0;
             for (int i = 0; i < tabLabels.Length; i++)
             {
-                if (GUI.Button(new Rect(18 + i * 76, 77, 72, 30), tabLabels[i], selected == i ? primaryStyle : buttonStyle))
+                if (GUI.Button(new Rect(18 + i * 66, 77, 62, 30), tabLabels[i], selected == i ? primaryStyle : buttonStyle))
                 {
                     capacityTab = i == 1; constructionTab = i == 2; researchTab = i == 3;
-                    productionTab = i == 4; citizenTab = i == 5; weatherTab = i == 6;
+                    productionTab = i == 4; citizenTab = i == 5; weatherTab = i == 6; structuralTab = i == 7;
                 }
             }
             if (capacityTab) { DrawCapacityTab(); GUI.DragWindow(new Rect(0, 5, 500, 65)); return; }
@@ -655,6 +698,7 @@ namespace Sarakiel.AllWillFall
             if (productionTab) { DrawProductionTab(); GUI.DragWindow(new Rect(0, 5, 500, 65)); return; }
             if (citizenTab) { DrawCitizensTab(); GUI.DragWindow(new Rect(0, 5, 500, 65)); return; }
             if (weatherTab) { DrawWeatherTab(); GUI.DragWindow(new Rect(0, 5, 500, 65)); return; }
+            if (structuralTab) { DrawStructuralTab(); GUI.DragWindow(new Rect(0, 5, 500, 65)); return; }
 
             GUI.Label(new Rect(19, 118, 85, 24), "ADD AMOUNT", mutedStyle);
             amountText = GUI.TextField(new Rect(113, 117, 133, 31), amountText, 8, inputStyle);
@@ -716,6 +760,72 @@ namespace Sarakiel.AllWillFall
                 catch (Exception e) { Logger.LogWarning("CAPACITY PATCH FAILED: " + fullName + " " + e); }
             }
             Logger.LogInfo("CAPACITY: " + capacityPatched + "/2 exact getters patched. Verify actual simulation on backup save.");
+        }
+
+        // Electricity storage has its own game class; batteries do NOT use ResourceBuilding.storage.
+        // Patch one canonical getter per type, once at startup. Never multiply asset fields,
+        // and never scan the scene in this hot path.
+        private void InstallBatteryCapacityPatch()
+        {
+            try
+            {
+                Assembly game = AppDomain.CurrentDomain.GetAssemblies().FirstOrDefault(a => a.GetName().Name == "ScriptsAssembly");
+                if (game == null) return;
+                int installed = 0;
+                HashSet<MethodInfo> seen = new HashSet<MethodInfo>();
+                foreach (string typeName in new[] { "ElectricityStorage", "ElectricityStorageHeight" })
+                {
+                    Type t = game.GetType(typeName, false);
+                    if (t == null) continue;
+                    // Most electricity stores expose get_Capacity. The alternative names
+                    // are only considered if that concrete type lacks the primary getter.
+                    MethodInfo method = null;
+                    foreach (string name in new[] { "get_Capacity", "get_ElectricityCapacity", "get_StorageCapacity" })
+                    {
+                        MethodInfo m = t.GetMethod(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly,
+                            null, Type.EmptyTypes, null);
+                        if (m == null) continue;
+                        if (m.ReturnType != typeof(int) && m.ReturnType != typeof(long) && m.ReturnType != typeof(float)) continue;
+                        method = m;
+                        break;
+                    }
+                    if (method == null)
+                    {
+                        Logger.LogWarning("BATTERY CAPACITY: no compatible getter on " + typeName);
+                        continue;
+                    }
+                    if (!seen.Add(method)) continue;
+                    string handler = method.ReturnType == typeof(int) ? "BatteryCapacityPostfixInt" :
+                        method.ReturnType == typeof(long) ? "BatteryCapacityPostfixLong" : "BatteryCapacityPostfixFloat";
+                    MethodInfo postfix = typeof(ResourceTweaks).GetMethod(handler, BindingFlags.NonPublic | BindingFlags.Static);
+                    harmony.Patch(method, postfix: new HarmonyMethod(postfix));
+                    installed++;
+                    Logger.LogInfo("BATTERY CAPACITY PATCH: " + typeName + "." + method.Name + " -> " + handler);
+                }
+                batteryGetterHookReady = installed > 0;
+                if (!batteryGetterHookReady) Logger.LogWarning("BATTERY CAPACITY: native getter not identified; battery multiplier inactive");
+            }
+            catch (Exception e) { Logger.LogWarning("BATTERY CAPACITY PATCH FAILED: " + e.Message); }
+        }
+
+        private static int EffectiveBatteryMultiplier()
+        {
+            return active != null && active.enableBattery != null && active.enableBattery.Value
+                ? Mathf.Clamp(active.batteryCapacityMultiplier.Value, 1, 1000) : 1;
+        }
+
+        private static void BatteryCapacityPostfixInt(ref int __result)
+        {
+            if (__result > 0) __result = MultiplySafe(__result, EffectiveBatteryMultiplier());
+        }
+        private static void BatteryCapacityPostfixLong(ref long __result)
+        {
+            int factor = EffectiveBatteryMultiplier();
+            if (__result > 0 && factor > 1) __result = __result > long.MaxValue / factor ? long.MaxValue : __result * factor;
+        }
+        private static void BatteryCapacityPostfixFloat(ref float __result)
+        {
+            if (__result > 0f) __result = Mathf.Min(__result * EffectiveBatteryMultiplier(), 1000000000f);
         }
 
         private static void HouseCapacityPostfix(ref int __result)
@@ -1073,6 +1183,150 @@ namespace Sarakiel.AllWillFall
             catch (Exception ex) { weatherSeaStatus = "Sea adjustment failed; check log"; Logger.LogWarning("WEATHER SEA: " + ex.Message); }
         }
 
+
+        // v0.11.4: modify source structural parameters BEFORE native job data is formed.
+        // This scan happens only on city initialization, never on a per-frame schedule.
+        // Managed StressJobUtility post-processing from v0.11.1 is deliberately removed:
+        // it can be bypassed by Burst jobs and left buildings collapsing.
+        private void InspectStructuralApiOnce()
+        {
+            structuralInspected = true;
+            try
+            {
+                Assembly game = AppDomain.CurrentDomain.GetAssemblies().FirstOrDefault(a => a.GetName().Name == "ScriptsAssembly");
+                Type parameters = game == null ? null : game.GetType("StressParameters", false);
+                Type layer = game == null ? null : game.GetType("StressLayer", false);
+                linkStrengthField = parameters == null ? null : parameters.GetField("LinkStrength", Flags);
+                if (linkStrengthField != null && linkStrengthField.FieldType == typeof(long))
+                {
+                    CollectStructuralAssets(parameters);
+                    UpdateStructuralStrengthAssets(true);
+                }
+                else Logger.LogWarning("STRUCTURE: StressParameters.LinkStrength Int64 field missing; strength inactive");
+
+                // This property is a *structural layer stress* decision, not the general
+                // demolition or scripted Collapser.Collapse entry point.
+                if (!structuralCollapseHookInstalled && layer != null)
+                {
+                    MethodInfo getter = layer.GetMethod("get_Collapses", Flags, null, Type.EmptyTypes, null);
+                    if (getter != null && getter.ReturnType == typeof(bool))
+                    {
+                        MethodInfo postfix = typeof(ResourceTweaks).GetMethod("StructuralLayerCollapsePostfix", BindingFlags.Static | BindingFlags.NonPublic);
+                        if (harmony == null) harmony = new Harmony("id.sarakiel.allwillfall.resourcetweaks.ui");
+                        harmony.Patch(getter, postfix: new HarmonyMethod(postfix));
+                        structuralCollapseHookInstalled = true;
+                        Logger.LogInfo("STRUCTURE PATCH: StressLayer.get_Collapses (managed layer condition) installed");
+                    }
+                }
+                if (verboseDiagnostics != null && verboseDiagnostics.Value)
+                Logger.LogInfo("STRUCTURE READY: strengthAssets=" + strengthAssetsDiscovered +
+                    " layerCollapseHook=" + structuralCollapseHookInstalled);
+            }
+            catch (Exception e) { Logger.LogWarning("STRUCTURE INITIALIZATION FAILED: " + e); }
+        }
+
+        private void CollectStructuralAssets(Type parametersType)
+        {
+            if (parametersType == null || linkStrengthField == null) return;
+            try
+            {
+                // One-time Unity object search, NOT a repeating scan.
+                UnityEngine.Object[] objects = Resources.FindObjectsOfTypeAll(parametersType);
+                foreach (UnityEngine.Object o in objects)
+                {
+                    if (o == null || originalLinkStrength.ContainsKey(o)) continue;
+                    long baseline = (long)linkStrengthField.GetValue(o);
+                    originalLinkStrength.Add(o, baseline);
+                }
+                strengthAssetsDiscovered = originalLinkStrength.Count;
+            }
+            catch (Exception ex) { Logger.LogWarning("STRUCTURE ASSET DISCOVERY: " + ex.Message); }
+        }
+
+        private void RestoreStructuralStrength()
+        {
+            if (linkStrengthField == null) { originalLinkStrength.Clear(); return; }
+            foreach (KeyValuePair<object, long> pair in originalLinkStrength)
+            {
+                try
+                {
+                    UnityEngine.Object unity = pair.Key as UnityEngine.Object;
+                    if (unity != null && unity && (long)linkStrengthField.GetValue(pair.Key) != pair.Value)
+                        linkStrengthField.SetValue(pair.Key, pair.Value);
+                }
+                catch { /* Asset destroyed or changed on scene unload. */ }
+            }
+            originalLinkStrength.Clear();
+            strengthAssetsDiscovered = 0;
+        }
+
+        private void UpdateStructuralStrengthAssets(bool force)
+        {
+            if (linkStrengthField == null || originalLinkStrength.Count == 0) return;
+            bool enabled = structuralStrengthEnabled != null && structuralStrengthEnabled.Value;
+            int multiplier = enabled ? Mathf.Clamp(structuralStrengthMultiplier.Value, 1, 50) : 1;
+            if (!force && appliedStructuralEnabled == enabled && appliedStructuralMultiplier == multiplier) return;
+            int updated = 0;
+            foreach (KeyValuePair<object, long> pair in originalLinkStrength)
+            {
+                try
+                {
+                    UnityEngine.Object unity = pair.Key as UnityEngine.Object;
+                    if (unity == null || !unity) continue;
+                    long baseline = pair.Value;
+                    long output = baseline;
+                    if (baseline > 0 && multiplier > 1)
+                        output = baseline > long.MaxValue / multiplier ? long.MaxValue : baseline * multiplier;
+                    if ((long)linkStrengthField.GetValue(pair.Key) != output)
+                    {
+                        linkStrengthField.SetValue(pair.Key, output);
+                        updated++;
+                    }
+                }
+                catch (Exception ex) { if (verboseDiagnostics.Value) Logger.LogWarning("STRUCTURE ASSET: " + ex.Message); }
+            }
+            appliedStructuralEnabled = enabled;
+            appliedStructuralMultiplier = multiplier;
+            if (verboseDiagnostics != null && verboseDiagnostics.Value)
+                Logger.LogInfo("STRUCTURE STRENGTH: multiplier=" + multiplier + " changedAssets=" + updated);
+        }
+
+        // Distinct from Collapser.Collapse. We only intercept the managed structural
+        // stress-layer's own collapse flag. Burst-compiled consumers can bypass this;
+        // never call this a guaranteed collapse-prevention mechanism.
+        private static void StructuralLayerCollapsePostfix(ref bool __result)
+        {
+            ResourceTweaks mod = active;
+            if (mod == null || mod.structuralPreventOverload == null || !mod.structuralPreventOverload.Value) return;
+            if (__result) __result = false;
+        }
+
+        private void OnDestroy() { RestoreStructuralStrength(); }
+
+        private void DrawStructuralTab()
+        {
+            GUI.Label(new Rect(19, 124, 525, 29), "STRUCTURAL PHYSICS", headingStyle);
+            GUI.Label(new Rect(20, 157, 510, 40), "Strengthen connections and prevent overload failure.", mutedStyle);
+            GUI.Label(new Rect(20, 204, 325, 24), "STRUCTURAL STRENGTH", bodyStyle);
+            if (GUI.Button(new Rect(363, 200, 178, 30), structuralStrengthEnabled.Value ? "ON" : "OFF", structuralStrengthEnabled.Value ? primaryStyle : buttonStyle))
+            {
+                structuralStrengthEnabled.Value = !structuralStrengthEnabled.Value;
+                UpdateStructuralStrengthAssets(false);
+            }
+            int[] options = { 1, 2, 5, 10, 25, 50 };
+            for (int i=0; i<options.Length; i++)
+                if (GUI.Button(new Rect(19 + 88*i, 242, 81, 30), options[i] + "x", structuralStrengthMultiplier.Value == options[i] ? primaryStyle : buttonStyle))
+                {
+                    structuralStrengthMultiplier.Value = options[i];
+                    UpdateStructuralStrengthAssets(false);
+                }
+            GUI.Label(new Rect(20, 287, 515, 23), "PREVENT OVERLOAD COLLAPSE", bodyStyle);
+            if (GUI.Button(new Rect(363, 316, 178, 30), structuralPreventOverload.Value ? "ON" : "OFF", structuralPreventOverload.Value ? primaryStyle : buttonStyle))
+                structuralPreventOverload.Value = !structuralPreventOverload.Value;
+            if (strengthAssetsDiscovered == 0)
+                GUI.Label(new Rect(20, 358, 520, 42), "Structure data unavailable in this city.", mutedStyle);
+        }
+
         private void DrawWeatherTab()
         {
             GUI.Label(new Rect(19, 123, 520, 29), "WEATHER & SEA LEVEL", headingStyle);
@@ -1105,23 +1359,34 @@ namespace Sarakiel.AllWillFall
 
         private void DrawCapacityTab()
         {
-            GUI.Label(new Rect(19, 120, 515, 26), "BUILDING CAPACITY MULTIPLIERS", headingStyle);
-            GUI.Label(new Rect(19, 152, 430, 23), "Storage multiplier: " + Mathf.Clamp(storageMultiplier.Value, 1, 100) + "x", bodyStyle);
+            GUI.Label(new Rect(19, 117, 515, 25), "BUILDING CAPACITY MULTIPLIERS", headingStyle);
+            GUI.Label(new Rect(19, 145, 430, 20), "Storage: " + Mathf.Clamp(storageMultiplier.Value, 1, 100) + "x", bodyStyle);
             int[] storageValues = { 1, 2, 5, 10, 25, 50 };
-            for (int i=0;i<storageValues.Length;i++)
-                if (GUI.Button(new Rect(19 + i*88, 183, 81, 31), storageValues[i] + "x", storageMultiplier.Value == storageValues[i] ? primaryStyle : presetStyle)) storageMultiplier.Value = storageValues[i];
-            GUI.Label(new Rect(19, 228, 430, 23), "Housing multiplier: " + Mathf.Clamp(housingMultiplier.Value, 1, 20) + "x", bodyStyle);
+            for (int i=0; i<storageValues.Length; i++)
+                if (GUI.Button(new Rect(19 + i*88, 168, 81, 28), storageValues[i] + "x", storageMultiplier.Value == storageValues[i] ? primaryStyle : presetStyle)) storageMultiplier.Value = storageValues[i];
+
+            GUI.Label(new Rect(19, 205, 430, 20), "Housing: " + Mathf.Clamp(housingMultiplier.Value, 1, 20) + "x", bodyStyle);
             int[] housingValues = { 1, 2, 3, 5, 10, 20 };
-            for (int i=0;i<housingValues.Length;i++)
-                if (GUI.Button(new Rect(19 + i*88, 259, 81, 31), housingValues[i] + "x", housingMultiplier.Value == housingValues[i] ? primaryStyle : presetStyle)) housingMultiplier.Value = housingValues[i];
-            GUI.Label(new Rect(19, 304, 400, 22), "ENABLED BUILDING TYPES", headingStyle);
-            enableWater.Value = GUI.Toggle(new Rect(20, 335, 165, 24), enableWater.Value, "Water storage", bodyStyle);
-            enableFood.Value = GUI.Toggle(new Rect(193, 335, 165, 24), enableFood.Value, "Food warehouse", bodyStyle);
-            enableFuel.Value = GUI.Toggle(new Rect(365, 335, 165, 24), enableFuel.Value, "Fuel warehouse", bodyStyle);
-            enableWarehouse.Value = GUI.Toggle(new Rect(20, 370, 245, 24), enableWarehouse.Value, "General warehouse", bodyStyle);
-            enableHouse.Value = GUI.Toggle(new Rect(280, 370, 245, 24), enableHouse.Value, "Houses", bodyStyle);
-            GUI.DrawTexture(new Rect(18, 414, 528, 1), borderTex);
-            GUI.Label(new Rect(20, 420, 525, 52), "Storage multipliers are applied automatically when the city loads.", mutedStyle);
+            for (int i=0; i<housingValues.Length; i++)
+                if (GUI.Button(new Rect(19 + i*88, 227, 81, 28), housingValues[i] + "x", housingMultiplier.Value == housingValues[i] ? primaryStyle : presetStyle)) housingMultiplier.Value = housingValues[i];
+
+            GUI.Label(new Rect(19, 269, 275, 22), "BATTERY STORAGE", headingStyle);
+            enableBattery.Value = GUI.Toggle(new Rect(389, 269, 145, 24), enableBattery.Value, "Enabled", bodyStyle);
+            int[] batteryValues = { 1, 10, 100, 1000 };
+            for (int i=0; i<batteryValues.Length; i++)
+                if (GUI.Button(new Rect(19 + i*132, 299, 124, 32), batteryValues[i] + "x", batteryCapacityMultiplier.Value == batteryValues[i] ? primaryStyle : presetStyle))
+                    batteryCapacityMultiplier.Value = batteryValues[i];
+
+            GUI.Label(new Rect(19, 343, 400, 22), "OTHER STORAGE TYPES", headingStyle);
+            enableWater.Value = GUI.Toggle(new Rect(20, 369, 165, 23), enableWater.Value, "Water", bodyStyle);
+            enableFood.Value = GUI.Toggle(new Rect(193, 369, 165, 23), enableFood.Value, "Food", bodyStyle);
+            enableFuel.Value = GUI.Toggle(new Rect(365, 369, 165, 23), enableFuel.Value, "Fuel", bodyStyle);
+            enableWarehouse.Value = GUI.Toggle(new Rect(20, 397, 245, 23), enableWarehouse.Value, "General warehouses", bodyStyle);
+            enableHouse.Value = GUI.Toggle(new Rect(280, 397, 245, 23), enableHouse.Value, "Houses", bodyStyle);
+            GUI.DrawTexture(new Rect(18, 435, 528, 1), borderTex);
+            GUI.Label(new Rect(20, 442, 520, 40), batteryGetterHookReady
+                ? "Battery and regular storage multipliers are independent."
+                : "Battery capacity hook unavailable; see BepInEx log.", mutedStyle);
         }
 
         private void RefreshCounts()
@@ -1724,9 +1989,34 @@ namespace Sarakiel.AllWillFall
             }
             catch (Exception ex) { Logger.LogWarning("PRODUCTION YIELD HOOK FAILED: " + ex.GetBaseException().Message); }
 
+            // Electricity is NOT a ResourceBlock. The game uses a separate
+            // ElectricityProducer.BuffedProduction(): int path, and its
+            // OnProductionComplete() credits get_ElectricityOutput() which
+            // delegates to BuffedProduction(). Patch the computed batch once,
+            // NOT city-wide electricity totals or consumption.
+            try
+            {
+                MethodInfo electricityOutput = AccessTools.Method(typeof(ElectricityProducer),
+                    "BuffedProduction", Type.EmptyTypes);
+                MethodInfo electricityPostfix = AccessTools.Method(typeof(ResourceTweaks),
+                    "ElectricityYieldPostfix");
+                if (electricityOutput != null && electricityOutput.ReturnType == typeof(int) &&
+                    electricityPostfix != null)
+                {
+                    harmony.Patch(electricityOutput, postfix: new HarmonyMethod(electricityPostfix));
+                    electricityYieldHookReady = true;
+                    Logger.LogInfo("ELECTRICITY YIELD PATCH: ElectricityProducer.BuffedProduction() -> int ready");
+                }
+                else Logger.LogWarning("ELECTRICITY YIELD: compatible BuffedProduction() absent; no electricity yield changes");
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning("ELECTRICITY YIELD HOOK FAILED: " + ex.GetBaseException().Message);
+            }
+
             // The v0.8.2 runtime scan confirmed WorkProvider.get_WorkInterval() -> float,
             // and WorkProvider.producers -> List<IWorkProducer>. Do not touch general
-            // work providers, including labs or jobs that have no ResourceProducer.
+            // work providers, including labs or jobs that have no producer.
             try
             {
                 MethodInfo getter = AccessTools.Method(typeof(WorkProvider), "get_WorkInterval", Type.EmptyTypes);
@@ -1737,11 +2027,26 @@ namespace Sarakiel.AllWillFall
                 {
                     harmony.Patch(getter, postfix: new HarmonyMethod(postfix));
                     speedHookReady = true;
-                    Logger.LogInfo("PRODUCTION SPEED PATCH: WorkProvider.get_WorkInterval() for ResourceProducer jobs only");
+                    Logger.LogInfo("PRODUCTION SPEED PATCH: WorkProvider.get_WorkInterval() for ResourceProducer + ElectricityProducer jobs");
                 }
                 else Logger.LogWarning("PRODUCTION SPEED: WorkInterval getter or producers field unavailable; no speed changes");
             }
             catch (Exception ex) { Logger.LogWarning("PRODUCTION SPEED PATCH FAILED: " + ex.GetBaseException().Message); }
+        }
+
+        // Electricity yield is multiplied on the native completed-batch value.
+        // A solar generator at 0% sun remains at 0. Avoid overflow at high
+        // multipliers and keep this hot-path hook allocation/reflection free.
+        private static void ElectricityYieldPostfix(ref int __result)
+        {
+            ResourceTweaks mod = active;
+            if (mod == null || !mod.electricityYieldHookReady ||
+                mod.productionYieldEnabled == null || !mod.productionYieldEnabled.Value ||
+                __result <= 0) return;
+            int factor = Math.Max(1, Math.Min(25, mod.productionYieldMultiplier.Value));
+            if (factor <= 1) return;
+            long multiplied = (long)__result * factor;
+            __result = (int)Math.Min(int.MaxValue, multiplied);
         }
 
         // This hot-path patch is allocation-free once an individual provider has
@@ -1751,7 +2056,7 @@ namespace Sarakiel.AllWillFall
         {
             ResourceTweaks mod = active;
             if (mod == null || !mod.speedHookReady || __instance == null || __result <= 0f) return;
-            // Both controls affect only confirmed resource-producing WorkProviders.
+            // Both controls affect recognized resource/electricity WorkProviders.
             // Combining them here avoids multiple Harmony patches / double division.
             int productionFactor = mod.productionSpeedEnabled.Value ?
                 Math.Max(1, Math.Min(25, mod.productionSpeedMultiplier.Value)) : 1;
@@ -1775,7 +2080,10 @@ namespace Sarakiel.AllWillFall
                 if (producers == null) return false;
                 foreach (object producer in producers)
                 {
-                    if (producer is ResourceProducer)
+                    // ElectricityProducer is a separate IWorkProducer, not a
+                    // ResourceProducer. Extend our proven WorkInterval patch
+                    // to electricity jobs without touching research/labor.
+                    if (producer is ResourceProducer || producer is ElectricityProducer)
                     {
                         resourceWorkProviderCache[provider] = true;
                         return true;
@@ -1874,7 +2182,7 @@ namespace Sarakiel.AllWillFall
         {
             GUI.Label(new Rect(19, 121, 520, 29), "PRODUCTION TWEAKS", headingStyle);
             GUI.Label(new Rect(19, 154, 522, 47),
-                "Adjust output amount and production speed separately.", bodyStyle);
+                "Adjust resource and electricity output and speed.", bodyStyle);
             bool yield = productionYieldEnabled.Value;
             bool oldYieldEnabled = yield, oldSpeedEnabled = productionSpeedEnabled.Value;
             int oldYield = productionYieldMultiplier.Value, oldSpeed = productionSpeedMultiplier.Value;
@@ -1907,7 +2215,7 @@ namespace Sarakiel.AllWillFall
             }
             GUI.DrawTexture(new Rect(18, 381, 528, 1), borderTex);
             GUI.Label(new Rect(20, 394, 520, 38),
-                "Output amount and production speed can be adjusted independently.", mutedStyle);
+                "Applies to resource and electricity-producing buildings.", mutedStyle);
         }
 
         private void DrawResearchTab()
