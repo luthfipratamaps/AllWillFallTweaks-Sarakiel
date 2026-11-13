@@ -1,4 +1,4 @@
-﻿$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'config.ps1')
 if ([string]::IsNullOrWhiteSpace($PluginsDir)) { throw 'PluginsDir is missing. Check config.ps1.' }
 $target = Join-Path $PluginsDir 'AllWillFallTweaks.dll'

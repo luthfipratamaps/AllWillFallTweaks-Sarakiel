@@ -1,35 +1,20 @@
-## v0.8.3.1 — APC.Stats compiler reference
-
-- Fix CS0012 (`IStatsUserComponent<T>`) by referencing the game-provided `APC.Stats.dll` in both build paths.
-- Keep experimental production speed getter hook and confirmed yield patch unchanged.
-- No claim of successful in-game compilation or production speed validation.
-
-## v0.8.3 — Scoped production-speed hook (experimental)
-
-- Target runtime-verified `WorkProvider.get_WorkInterval(): float` instead of nonexistent `get_TotalCycleTime()`.
-- Apply speed divisor only to providers with a `ResourceProducer`; keep 0.1 minimum interval and scene-local cache.
-- Preserve confirmed-working production yield and all previously working modules.
-- Updated version labels and production UI descriptions.
-- Requires in-game cycle timing verification.
-
-## 0.8.2.2 — Compiler dependency fix
-
-- Add game-provided `Unity.Collections.dll` to `build.ps1` and the project file.
-- Resolve `CS0012` for `Unity.Collections.IIndexable<T>` indirectly required by `APC.FixedDataTypes.FixedIntArray16`.
-- No changes to production gameplay hooks. Yield remains experimental; speed remains diagnostic-only.
-- Build against your installed game's managed assemblies; Windows compilation not verified here.
-
-## v0.8.2.1 — Build dependency fix
-
-- Added game-managed `APC.FixedDataTypes.dll` to the PowerShell compiler references and project file (fixes CS0012 for `FixedIntArray16`).
-- Added a clear missing-dependency check before compilation.
-- No changes to production, construction, research, or storage gameplay logic.
-
 # Changelog
 
-## v0.8.2
+## v0.9.5 — Performance and UI stabilization
 
-- Replaced unavailable ResourceBlock multiplication operator with guarded output-only Produce replay for experimental yield.
-- Explicitly disabled unsupported speed hook; added WorkProvider/Workplace/ResourceBlock signatures to manual API scan.
-- Preserved research, construction, resources, capacity, initialization and configuration.
-- No changes to factory input consumption hooks.
+- Preserved all gameplay controls from the user-confirmed v0.9.4 baseline.
+- Removed API discovery buttons, runtime counters, and engineering instructions from all tabs.
+- Kept automatic full storage discovery on city readiness and immediate capacity application.
+- Removed recurring 30-second Unity-object discovery; routine monitoring uses the city's registry.
+- Preserved manual Resources → Refresh for exceptional/unregistered storage detection.
+- Reduced routine scan allocations by removing Stopwatch timing around scheduled checks.
+- Gated verbose per-storage logging behind the existing `VerboseLogging` config toggle.
+- Clarified the difference between resource-producing Work Speed and other citizen tasks.
+- Preserved settings and existing build/install scripts.
+
+## v0.9.4 — Citizen productivity (working baseline)
+
+- Added independent Work Speed and Carry Capacity multipliers, with GUI controls and saved settings.
+- User confirmed in-game working speed and carrying capacity.
+
+For older versions, consult the existing comprehensive development changelog retained separately in prior releases.

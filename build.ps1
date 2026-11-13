@@ -1,4 +1,4 @@
-﻿$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 . "$PSScriptRoot\config.ps1"
 try {

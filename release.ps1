@@ -1,4 +1,4 @@
-﻿$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'config.ps1')
 & (Join-Path $PSScriptRoot 'build.ps1')
 if ($LASTEXITCODE -ne 0) { throw 'Build failed; release aborted.' }

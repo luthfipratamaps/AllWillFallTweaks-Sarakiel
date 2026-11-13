@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -12,7 +12,7 @@ using UnityEngine.SceneManagement;
 
 namespace Sarakiel.AllWillFall
 {
-    [BepInPlugin("id.sarakiel.allwillfall.resourcetweaks", "All Will Fall - Resource Tweaks", "0.8.3.1")]
+    [BepInPlugin("id.sarakiel.allwillfall.resourcetweaks", "All Will Fall - Resource Tweaks", "0.9.5")]
     public class ResourceTweaks : BaseUnityPlugin
     {
         private readonly string[] names = { "Water", "Food", "Junk", "Wood", "Metal", "Sand", "Fuel", "Goods", "Tools" };
@@ -31,6 +31,32 @@ namespace Sarakiel.AllWillFall
         private bool constructionTab;
         private bool researchTab;
         private bool productionTab;
+        private bool citizenTab;
+        private ConfigEntry<bool> citizenMaxHappiness, citizenNoHunger, citizenNoThirst, citizenSpeedEnabled;
+        private ConfigEntry<int> citizenSpeedMultiplier;
+        private ConfigEntry<bool> citizenWorkSpeedEnabled, citizenCarryEnabled;
+        private ConfigEntry<int> citizenWorkSpeedMultiplier, citizenCarryMultiplier;
+        private int citizenCarryHooks;
+        private int citizenGroupIndex;
+        private int citizenRecruitCount = 5;
+        private bool citizenScanDone;
+        private int citizenHappinessHooks, citizenNeedsHooks, citizenMovementHooks;
+        private int citizenNeedsStateHooks;
+        private static FieldInfo citizenFoodConsumptionField, citizenWaterConsumptionField;
+        private static FieldInfo citizenFoodResourceField, citizenWaterResourceField;
+        private static FieldInfo needSatisfiedField, needTargetField, needChargeField, needChargePerUnitField;
+        private static FieldInfo cityCitizensListField;
+        private static int needsSuppressedCalls;
+        private static bool needsPatchLogged;
+        private MethodInfo citizenRecruitMethod;
+        private object citizenRecruitOwner;
+        private Type citizenRecruitGroupType;
+        private string citizenStatus = "Citizen APIs not scanned yet";
+        private int citizenCallCount;
+        private ConfigEntry<bool> revealRecruitedGroups;
+
+        private float nextCitizenResolveAt;
+        private static readonly string[] citizenGroups = { "Workers", "Sailors", "Engineers" };
         private ConfigEntry<bool> productionYieldEnabled, productionSpeedEnabled;
         private ConfigEntry<int> productionYieldMultiplier, productionSpeedMultiplier;
         private bool productionAuditWritten;
@@ -140,8 +166,8 @@ namespace Sarakiel.AllWillFall
             enableFuel = Config.Bind("Capacity", "FuelWarehouse", true, "Enable fuel warehouse multiplier");
             enableWarehouse = Config.Bind("Capacity", "GeneralWarehouse", true, "Enable general warehouse multiplier");
             enableHouse = Config.Bind("Capacity", "Housing", true, "Enable house occupancy multiplier");
-            autoScanEnabled = Config.Bind("Startup", "AutoScanOnCityLoad", true, "Automatically discover buildings/resources after loading a city. Manual Rescan is still available.");
-            autoScanInterval = Config.Bind("Startup", "BackgroundScanIntervalSeconds", 5f, "Interval for discovering newly constructed storages (minimum 1 second).");
+            autoScanEnabled = Config.Bind("Startup", "AutoScanOnCityLoad", true, "Automatically discover storage buildings when a city loads. Manual Refresh is available.");
+            autoScanInterval = Config.Bind("Startup", "BackgroundScanIntervalSeconds", 5f, "Lightweight registry update interval; a full scene scan runs once at city initialization.");
             verboseDiagnostics = Config.Bind("Diagnostics", "VerboseLogging", false, "Log resource reflection details, per-storage traces and scan attempts for troubleshooting.");
             performanceDiagnostics = Config.Bind("Diagnostics", "PerformanceDiagnostics", false,
                 "Periodically report frame hitches and worst scan timings (no per-frame logging).");
@@ -167,6 +193,26 @@ namespace Sarakiel.AllWillFall
                 "Final produced resources multiplier; does not scale material costs.");
             productionSpeedMultiplier = Config.Bind("Production", "SpeedMultiplier", 5,
                 "Resource-producer work interval divisor. Requires active workers; minimum interval is 0.1.");
+            citizenMaxHappiness = Config.Bind("Citizens", "MaximumHappiness", false,
+                "Override CityCitizenNeeds.GetHappiness with the native group maximum; affects getter consumers.");
+            citizenNoHunger = Config.Bind("Citizens", "PreventStarvation", false,
+                "Skip citizen Food requirements and mark citizens fed; also suppress starvation condition.");
+            citizenNoThirst = Config.Bind("Citizens", "PreventDehydration", false,
+                "Skip citizen Water requirements and mark citizens hydrated; also suppress dehydration condition.");
+            citizenSpeedEnabled = Config.Bind("Citizens", "MovementSpeedEnabled", false,
+                "Experimental: multiply verified citizen movement speed getter(s), if available.");
+            citizenSpeedMultiplier = Config.Bind("Citizens", "MovementSpeedMultiplier", 2,
+                "Citizen movement multiplier, 1-5x. Applies only if runtime hook is found.");
+            citizenWorkSpeedEnabled = Config.Bind("Citizens", "WorkSpeedEnabled", false,
+                "Accelerate resource-producing worker cycles separately from Production Speed; multipliers stack, minimum cycle interval 0.1 seconds.");
+            citizenWorkSpeedMultiplier = Config.Bind("Citizens", "WorkSpeedMultiplier", 5,
+                "Worker production speed divisor (1, 2, 5, 10, 25, 50). Combined with Production Speed only for resource-producing WorkProviders.");
+            citizenCarryEnabled = Config.Bind("Citizens", "CarryCapacityEnabled", false,
+                "Multiply citizens' carrying capacity using the game's native getter.");
+            citizenCarryMultiplier = Config.Bind("Citizens", "CarryCapacityMultiplier", 10,
+                "Carry capacity multiplier (1, 2, 5, 10, 25, 50); result clamped to avoid integer overflow.");
+            revealRecruitedGroups = Config.Bind("Citizens", "RevealRecruitedGroupsInHUD", true,
+                "Experimental: include recruited social groups in the city unlocked-group list and request HUD refresh. May also expose faction features; use a backup save.");
             amountText = Math.Max(1, Math.Min(1000000, defaultAmount.Value)).ToString();
             window.x = Mathf.Clamp(savedX.Value, 0, Mathf.Max(0, Screen.width - window.width));
             window.y = Mathf.Clamp(savedY.Value, 0, Mathf.Max(0, Screen.height - window.height));
@@ -199,6 +245,7 @@ namespace Sarakiel.AllWillFall
             InstallConstructionDirectPatches();
             InstallResearchHooks();
             InstallProductionHooks();
+            InstallCitizenHooks();
             // City data is unavailable during Awake; defer scene scan to AutoScanCity.
             nextAutoScanAt = Time.unscaledTime + 1f;
         }
@@ -322,6 +369,7 @@ namespace Sarakiel.AllWillFall
         {
             ProcessQueuedConstruction();
             ResearchPeriodicCheck();
+            // Citizen manager resolution is only attempted when the user requests recruitment.
             if (autoScanEnabled != null && autoScanEnabled.Value) AutoScanCity();
             // Five primitive comparisons; no Unity scene scan or allocations.
             DetectCapacitySettingsChange();
@@ -354,6 +402,8 @@ namespace Sarakiel.AllWillFall
                 researchAuditWritten = false;
                 productionAuditWritten = false;
                 resourceWorkProviderCache.Clear();
+                citizenRecruitOwner = null;
+                nextCitizenResolveAt = 0f;
                 researchManager = null;
                 lastCompletedResearch = null;
                 nextResearchDiscoveryAt = 0f;
@@ -397,22 +447,13 @@ namespace Sarakiel.AllWillFall
                 // Later scheduled checks use the inexpensive city registry.
                 bool initialCityScan = ready && !lastManagerReady;
                 lastManagerReady = ready;
-                Stopwatch scanWatch = Stopwatch.StartNew();
                 if (ready) ScanStorageInstances(initialCityScan);
-                scanWatch.Stop();
-                RecordPerformance("Storage discovery", scanWatch.Elapsed.TotalMilliseconds, ref scannedStorageRuns, ref maxStorageScanMs);
-                Stopwatch syncWatch = Stopwatch.StartNew();
                 ApplyStorageCapacities();
-                syncWatch.Stop();
-                RecordPerformance("Capacity synchronization", syncWatch.Elapsed.TotalMilliseconds, ref syncedCapacityRuns, ref maxCapacitySyncMs);
                 // Resource count discovery is expensive; the counts aren't visible
                 // while F8 is closed. Refresh only when the Resources tab is shown.
-                if (ready && visible && !capacityTab && !constructionTab && !researchTab && !productionTab)
+                if (ready && visible && !capacityTab && !constructionTab && !researchTab && !productionTab && !citizenTab)
                 {
-                    Stopwatch resourceWatch = Stopwatch.StartNew();
                     RefreshCounts();
-                    resourceWatch.Stop();
-                    RecordPerformance("Resource refresh", resourceWatch.Elapsed.TotalMilliseconds, ref resourceRefreshRuns, ref maxResourceRefreshMs);
                 }
                 autoScanAttempts++;
                 if (verboseDiagnostics.Value && (autoScanAttempts <= 3 || autoScanAttempts == 10))
@@ -545,6 +586,8 @@ namespace Sarakiel.AllWillFall
         {
             if (!visible) return;
             InitStyles();
+            // Citizen productivity controls need a taller panel; other tabs retain their layout.
+            window.height = citizenTab ? 636f : 505f;
             window.x = Mathf.Clamp(window.x, 0, Mathf.Max(0, Screen.width - window.width));
             window.y = Mathf.Clamp(window.y, 0, Mathf.Max(0, Screen.height - window.height));
             window = GUI.Window(WindowId, window, DrawWindow, "", panelStyle);
@@ -564,19 +607,25 @@ namespace Sarakiel.AllWillFall
         {
             GUI.DrawTexture(new Rect(0, 0, 564, 4), primaryTex);
             GUI.Label(new Rect(19, 14, 400, 29), "ALL WILL FALL  /  TWEAKS", headingStyle);
-            GUI.Label(new Rect(22, 42, 450, 17), "SARAKIEL  •  TWEAKS DASHBOARD   v0.8.1", subtitleStyle);
+            GUI.Label(new Rect(22, 42, 450, 17), "SARAKIEL  •  TWEAKS   v0.9.5", subtitleStyle);
             if (GUI.Button(new Rect(516, 18, 30, 28), "×", closeStyle)) { visible = false; pointerCaptured = false; SaveWindowPosition(); }
             GUI.DrawTexture(new Rect(18, 69, 528, 1), borderTex);
-            // Five compact tabs fit the existing window without hiding any controls.
-            if (GUI.Button(new Rect(18, 77, 100, 30), "RESOURCES", !capacityTab && !constructionTab && !researchTab && !productionTab ? primaryStyle : buttonStyle)) { capacityTab = false; constructionTab = false; researchTab = false; productionTab = false; }
-            if (GUI.Button(new Rect(125, 77, 100, 30), "CAPACITY", capacityTab ? primaryStyle : buttonStyle)) { capacityTab = true; constructionTab = false; researchTab = false; productionTab = false; }
-            if (GUI.Button(new Rect(232, 77, 100, 30), "BUILD", constructionTab ? primaryStyle : buttonStyle)) { constructionTab = true; capacityTab = false; researchTab = false; productionTab = false; }
-            if (GUI.Button(new Rect(339, 77, 100, 30), "RESEARCH", researchTab ? primaryStyle : buttonStyle)) { researchTab = true; capacityTab = false; constructionTab = false; productionTab = false; }
-            if (GUI.Button(new Rect(446, 77, 100, 30), "OUTPUT", productionTab ? primaryStyle : buttonStyle)) { productionTab = true; capacityTab = false; constructionTab = false; researchTab = false; }
+            // Six tabs sized to fit within 564px window, with no horizontal overflow.
+            string[] labels = { "RESOURCES", "CAPACITY", "BUILD", "RESEARCH", "OUTPUT", "CITIZENS" };
+            int selected = citizenTab ? 5 : productionTab ? 4 : researchTab ? 3 : constructionTab ? 2 : capacityTab ? 1 : 0;
+            for (int i = 0; i < labels.Length; i++)
+            {
+                if (GUI.Button(new Rect(18 + i * 89, 77, 83, 30), labels[i], selected == i ? primaryStyle : buttonStyle))
+                {
+                    capacityTab = i == 1; constructionTab = i == 2; researchTab = i == 3;
+                    productionTab = i == 4; citizenTab = i == 5;
+                }
+            }
             if (capacityTab) { DrawCapacityTab(); GUI.DragWindow(new Rect(0, 5, 500, 65)); return; }
             if (constructionTab) { DrawConstructionTab(); GUI.DragWindow(new Rect(0, 5, 500, 65)); return; }
             if (researchTab) { DrawResearchTab(); GUI.DragWindow(new Rect(0, 5, 500, 65)); return; }
             if (productionTab) { DrawProductionTab(); GUI.DragWindow(new Rect(0, 5, 500, 65)); return; }
+            if (citizenTab) { DrawCitizensTab(); GUI.DragWindow(new Rect(0, 5, 500, 65)); return; }
 
             GUI.Label(new Rect(19, 118, 85, 24), "ADD AMOUNT", mutedStyle);
             amountText = GUI.TextField(new Rect(113, 117, 133, 31), amountText, 8, inputStyle);
@@ -607,7 +656,7 @@ namespace Sarakiel.AllWillFall
                 status = "All resource additions requested (see log for results)";
                 RefreshCounts();
             }
-            if (GUI.Button(new Rect(394, 395, 152, 38), "⟳  RESCAN", buttonStyle))
+            if (GUI.Button(new Rect(394, 395, 152, 38), "⟳  REFRESH", buttonStyle))
             { inspected = false; manager = null; counts.Clear(); LocateManager(); ScanStorageInstances(true); ApplyStorageCapacities(); RefreshCounts(); }
             GUI.DrawTexture(new Rect(18, 445, 528, 1), borderTex);
             GUI.Label(new Rect(19, 451, 524, 32), status, mutedStyle);
@@ -706,7 +755,7 @@ namespace Sarakiel.AllWillFall
         private readonly HashSet<object> unknownStorageLogged = new HashSet<object>(ReferenceEqualityComparer.Instance);
         private float lastFullStorageScan = -100f;
         private bool capacityScanBusy;
-        private const float FullStorageRescanSeconds = 30f;
+        // Full Unity-object scan only on city initialization or an explicit manual refresh.
         private sealed class ReferenceEqualityComparer : IEqualityComparer<object>
         {
             public static readonly ReferenceEqualityComparer Instance = new ReferenceEqualityComparer();
@@ -729,10 +778,10 @@ namespace Sarakiel.AllWillFall
                 if (map != null)
                     foreach (DictionaryEntry item in map) RegisterStorage(item.Value, item.Key);
 
-                // Expensive fallback: discover ResourceBuilding components missing from
+                // Initialization-only fallback: discover ResourceBuilding components missing from
                 // the registry. Force once on city readiness (and on manual Rescan),
-                // otherwise run at most every 30s. City registry checks run every 5s.
-                if (!force && Time.unscaledTime - lastFullStorageScan < FullStorageRescanSeconds) return;
+                // never repeat automatically after initialization. Registry checks run every 5s.
+                if (!force) return;
                 lastFullStorageScan = Time.unscaledTime;
                 Type rbType = AccessTools.TypeByName("ResourceBuilding");
                 if (rbType != null && typeof(UnityEngine.Object).IsAssignableFrom(rbType))
@@ -776,7 +825,7 @@ namespace Sarakiel.AllWillFall
             {
                 bool changed = !storageKinds.ContainsKey(storage) || storageKinds[storage] != kind;
                 storageKinds[storage] = kind;
-                if (changed) Logger.LogInfo("CAPACITY OWNER: " + kind + " storageHash=" +
+                if (changed && verboseDiagnostics.Value) Logger.LogInfo("CAPACITY OWNER: " + kind + " storageHash=" +
                     System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(storage) + " : " + id.Substring(0, Math.Min(125,id.Length)));
             }
             if (!storageBaseCapacities.ContainsKey(storage))
@@ -823,7 +872,7 @@ namespace Sarakiel.AllWillFall
                     if (current == desired) continue;
                     field.SetValue(storage, desired);
                     if (appliedCapacityLog.Add(storage))
-                        Logger.LogInfo("CAPACITY APPLY: " + entry.Value + " base=" + original +
+                        if (verboseDiagnostics.Value) Logger.LogInfo("CAPACITY APPLY: " + entry.Value + " base=" + original +
                             " multiplier=" + multiplier + " current=" + current + " new=" + desired);
                 }
                 catch (Exception ex)
@@ -878,8 +927,7 @@ namespace Sarakiel.AllWillFall
             enableWarehouse.Value = GUI.Toggle(new Rect(20, 370, 245, 24), enableWarehouse.Value, "General warehouse", bodyStyle);
             enableHouse.Value = GUI.Toggle(new Rect(280, 370, 245, 24), enableHouse.Value, "Houses", bodyStyle);
             GUI.DrawTexture(new Rect(18, 414, 528, 1), borderTex);
-            GUI.Label(new Rect(20, 420, 525, 52), "Capacity patches: " + capacityPatched + " | tracked storages: " + storageKinds.Count +
-                "\nCheck CAPACITY TRACE/OWNER in LogOutput.log. Slider fill may still use base capacity.", mutedStyle);
+            GUI.Label(new Rect(20, 420, 525, 52), "Storage multipliers are applied automatically when the city loads.", mutedStyle);
         }
 
         private void RefreshCounts()
@@ -1508,12 +1556,17 @@ namespace Sarakiel.AllWillFall
         private static void ProductionIntervalPostfix(WorkProvider __instance, ref float __result)
         {
             ResourceTweaks mod = active;
-            if (mod == null || !mod.speedHookReady || __instance == null ||
-                !mod.productionSpeedEnabled.Value) return;
-            int factor = Math.Max(1, Math.Min(25, mod.productionSpeedMultiplier.Value));
-            if (factor <= 1 || __result <= 0f) return;
-            if (!mod.IsResourceProducingWorkProvider(__instance)) return;
-            __result = Math.Max(0.1f, __result / factor);
+            if (mod == null || !mod.speedHookReady || __instance == null || __result <= 0f) return;
+            // Both controls affect only confirmed resource-producing WorkProviders.
+            // Combining them here avoids multiple Harmony patches / double division.
+            int productionFactor = mod.productionSpeedEnabled.Value ?
+                Math.Max(1, Math.Min(25, mod.productionSpeedMultiplier.Value)) : 1;
+            int workerFactor = mod.citizenWorkSpeedEnabled != null && mod.citizenWorkSpeedEnabled.Value ?
+                Math.Max(1, Math.Min(50, mod.citizenWorkSpeedMultiplier.Value)) : 1;
+            int divisor = productionFactor * workerFactor;
+            if (divisor <= 1 || !mod.IsResourceProducingWorkProvider(__instance)) return;
+            // Keep minimum nonzero interval to protect simulation and update loops.
+            __result = Math.Max(0.1f, __result / divisor);
             mod.productionSpeedCalls++;
         }
 
@@ -1625,10 +1678,9 @@ namespace Sarakiel.AllWillFall
 
         private void DrawProductionTab()
         {
-            GUI.Label(new Rect(19, 121, 520, 29), "PRODUCTION TWEAKS  /  GAME OVERRIDES", headingStyle);
+            GUI.Label(new Rect(19, 121, 520, 29), "PRODUCTION TWEAKS", headingStyle);
             GUI.Label(new Rect(19, 154, 522, 47),
-                "Independent output yield and cycle speed preferences.\n" +
-                "Yield: final output only. Speed: production-only work interval.", bodyStyle);
+                "Adjust output amount and production speed separately.", bodyStyle);
             bool yield = productionYieldEnabled.Value;
             bool oldYieldEnabled = yield, oldSpeedEnabled = productionSpeedEnabled.Value;
             int oldYield = productionYieldMultiplier.Value, oldSpeed = productionSpeedMultiplier.Value;
@@ -1659,25 +1711,16 @@ namespace Sarakiel.AllWillFall
             {
                 try { Config.Save(); } catch (Exception ex) { Logger.LogWarning("PRODUCTION SETTINGS SAVE FAILED: " + ex.Message); }
             }
-            if (GUI.Button(new Rect(19, 369, 526, 40), "SCAN PRODUCTION API / WRITE LOG", primaryStyle))
-            {
-                productionAuditWritten = false;
-                ScanProductionAPI();
-            }
-            GUI.DrawTexture(new Rect(18, 422, 528, 1), borderTex);
-            GUI.Label(new Rect(19, 430, 526, 62),
-                "v0.8.3.1 production hooks: yield=" + (yieldHookReady ? "READY" : "UNAVAILABLE") +
-                " speed=" + (speedHookReady ? "READY" : "UNAVAILABLE") + "\n" +
-                "Applied calls (since load): yield=" + productionYieldCalls + " speed=" + productionSpeedCalls + "\n" +
-                "Use backup saves; report output amounts and cycle times.", mutedStyle);
+            GUI.DrawTexture(new Rect(18, 381, 528, 1), borderTex);
+            GUI.Label(new Rect(20, 394, 520, 38),
+                "Output amount and production speed can be adjusted independently.", mutedStyle);
         }
 
         private void DrawResearchTab()
         {
-            GUI.Label(new Rect(19, 121, 520, 29), "RESEARCH TWEAKS  /  GAME OVERRIDES", headingStyle);
+            GUI.Label(new Rect(19, 121, 520, 29), "RESEARCH TWEAKS", headingStyle);
             GUI.Label(new Rect(19, 155, 520, 53),
-                "Independent research settings, saved to BepInEx config.\n" +
-                "Native completion + research-only material cost override.", bodyStyle);
+                "Choose whether research needs time or materials.", bodyStyle);
             GUI.Label(new Rect(23, 213, 365, 34), "Instant Research", bodyStyle);
             bool instant = instantResearchRequested.Value;
             if (GUI.Button(new Rect(413, 211, 128, 34), instant ? "ON  [X]" : "OFF", instant ? primaryStyle : buttonStyle)) instant = !instant;
@@ -1691,24 +1734,453 @@ namespace Sarakiel.AllWillFall
                 try { Config.Save(); Logger.LogInfo("RESEARCH SETTINGS SAVED: instant=" + instant + " free=" + free); }
                 catch (Exception ex) { Logger.LogWarning("RESEARCH CONFIG SAVE FAILED: " + ex.Message); }
             }
-            if (GUI.Button(new Rect(19, 322, 526, 39), "SCAN RESEARCH API  /  WRITE LOG", primaryStyle))
+            GUI.DrawTexture(new Rect(18, 326, 528, 1), borderTex);
+            GUI.Label(new Rect(20, 341, 520, 44),
+                "Changes are saved automatically.", mutedStyle);
+        }
+
+
+        // v0.9 Citizen Tweaks. Reflection-only compatibility hooks; a missing or
+        // incompatible target must never prevent the stable v0.8 systems loading.
+        // Exact signatures confirmed by the v0.9.1 in-game API scan.
+        // Only the working citizen-specific methods are patched; other gameplay
+        // systems and the original v0.8 production hooks are untouched.
+        private static MethodInfo citizenMaximumHappinessMethod;
+        private void InstallCitizenHooks()
+        {
+            citizenHappinessHooks = citizenNeedsHooks = citizenMovementHooks = 0;
+            Type needs = AccessTools.TypeByName("CityCitizenNeeds");
+            Type citizen = AccessTools.TypeByName("Citizen");
+            Type group = AccessTools.TypeByName("SocialGroup");
+            if (needs != null && group != null)
             {
-                researchAuditWritten = false;
-                ScanResearchAPI();
+                citizenMaximumHappinessMethod = AccessTools.Method(needs, "GetMaximumGroupHappiness", new[] { group });
+                MethodInfo getter = AccessTools.Method(needs, "GetHappiness", new[] { group });
+                if (getter != null && getter.ReturnType == typeof(int))
+                    citizenHappinessHooks += PatchCitizenExact(getter, "CitizenGroupHappinessPostfix");
             }
-            GUI.DrawTexture(new Rect(18, 387, 528, 1), borderTex);
-            GUI.Label(new Rect(19, 399, 526, 81),
-                "RESEARCH v0.8.1  —  direct research hooks.\n" +
-                "Independent ON/OFF settings are saved automatically.\n" +
-                "Test on a backup save; report any incomplete unlocks.", mutedStyle);
+            if (citizen != null)
+            {
+                MethodInfo starving = AccessTools.Method(citizen, "get_starving", Type.EmptyTypes);
+                MethodInfo dehydrated = AccessTools.Method(citizen, "get_dehydrated", Type.EmptyTypes);
+                if (starving != null && starving.ReturnType == typeof(bool))
+                    citizenNeedsHooks += PatchCitizenExact(starving, "CitizenNoHungerPostfix");
+                if (dehydrated != null && dehydrated.ReturnType == typeof(bool))
+                    citizenNeedsHooks += PatchCitizenExact(dehydrated, "CitizenNoThirstPostfix");
+                MethodInfo walk = AccessTools.Method(citizen, "get_WalkSpeed", Type.EmptyTypes);
+                if (walk != null && walk.ReturnType == typeof(float))
+                    citizenMovementHooks += PatchCitizenExact(walk, "CitizenMovementFloat");
+                MethodInfo carry = AccessTools.Method(citizen, "get_CarryCapacity", Type.EmptyTypes);
+                if (carry != null && carry.ReturnType == typeof(int))
+                    citizenCarryHooks += PatchCitizenExact(carry, "CitizenCarryCapacityPostfix");
+            }
+            InstallCitizenSatisfactionHooks(citizen);
+            ScanRecruitmentSignature(false);
+            citizenScanDone = true;
+            Logger.LogInfo("CITIZENS: happiness=" + citizenHappinessHooks +
+                " needs=" + citizenNeedsHooks + " satisfaction=" + citizenNeedsStateHooks + " speed=" + citizenMovementHooks +
+                " carry=" + citizenCarryHooks + " work=" + (speedHookReady ? "INTERVAL READY" : "UNAVAILABLE") +
+                " recruit=" + (citizenRecruitMethod != null ? "native AddCitizen(SocialGroup) ready" : "unavailable"));
+        }
+
+        private int PatchCitizenExact(MethodInfo method, string postfixName)
+        {
+            if (method == null) return 0;
+            try
+            {
+                MethodInfo callback = typeof(ResourceTweaks).GetMethod(postfixName, BindingFlags.NonPublic | BindingFlags.Static);
+                if (callback == null) return 0;
+                harmony.Patch(method, postfix: new HarmonyMethod(callback));
+                Logger.LogInfo("CITIZEN PATCH: " + method.DeclaringType.Name + "." + method.Name);
+                return 1;
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning("CITIZEN PATCH SKIPPED: " + method.Name + " " + ex.GetBaseException().Message);
+                return 0;
+            }
+        }
+
+        private static void CitizenGroupHappinessPostfix(object __instance, object __0, ref int __result)
+        {
+            if (active == null || !active.citizenMaxHappiness.Value ||
+                citizenMaximumHappinessMethod == null || __instance == null || __0 == null) return;
+            try
+            {
+                object maximum = citizenMaximumHappinessMethod.Invoke(__instance, new object[] { __0 });
+                if (maximum is int && (int)maximum > __result) __result = (int)maximum;
+            }
+            catch { /* Keep vanilla result if the city's happiness API is not ready. */ }
+        }
+        private static void CitizenNoHungerPostfix(ref bool __result)
+        {
+            if (active != null && active.citizenNoHunger.Value) __result = false;
+        }
+        private static void CitizenNoThirstPostfix(ref bool __result)
+        {
+            if (active != null && active.citizenNoThirst.Value) __result = false;
+        }
+        // v0.9.3: The starvation/dehydration getters only report a boolean.
+        // Food/Water satisfaction is stored separately inside CitizenConsumption.
+        // Intercept ONLY the corresponding citizen resource-consumption call, and
+        // synthesize a satisfied state without removing actual inventory.
+        // None of the normal Junk/Goods or building costs are intercepted.
+        private void InstallCitizenSatisfactionHooks(Type citizenType)
+        {
+            citizenNeedsStateHooks = 0;
+            try
+            {
+                Type cityType = AccessTools.TypeByName("CityCitizens");
+                Type consumptionType = AccessTools.TypeByName("CitizenConsumption");
+                if (cityType == null || citizenType == null || consumptionType == null) return;
+                citizenFoodConsumptionField = AccessTools.Field(citizenType, "foodConsumption");
+                citizenWaterConsumptionField = AccessTools.Field(citizenType, "waterConsumption");
+                citizenFoodResourceField = AccessTools.Field(cityType, "resourceFood");
+                citizenWaterResourceField = AccessTools.Field(cityType, "resourceWater");
+                cityCitizensListField = AccessTools.Field(cityType, "mainCitizens");
+                needSatisfiedField = AccessTools.Field(consumptionType, "satisfied");
+                needTargetField = AccessTools.Field(consumptionType, "consumptionTarget");
+                needChargeField = AccessTools.Field(consumptionType, "consumptionCharge");
+                needChargePerUnitField = AccessTools.Field(consumptionType, "ChargePerUnit");
+                if (citizenFoodConsumptionField == null || citizenWaterConsumptionField == null ||
+                    citizenFoodResourceField == null || citizenWaterResourceField == null ||
+                    needSatisfiedField == null || needTargetField == null || needChargeField == null)
+                {
+                    Logger.LogWarning("CITIZEN NEEDS: required consumption fields missing; state overrides disabled");
+                    return;
+                }
+                MethodInfo consume = AccessTools.Method(cityType, "HandleResourceConsumption");
+                if (consume != null && consume.ReturnType == typeof(void) &&
+                    consume.GetParameters().Length == 9)
+                {
+                    MethodInfo callback = typeof(ResourceTweaks).GetMethod("CitizenConsumptionPrefix", BindingFlags.NonPublic | BindingFlags.Static);
+                    harmony.Patch(consume, prefix: new HarmonyMethod(callback));
+                    citizenNeedsStateHooks++;
+                    Logger.LogInfo("CITIZEN NEEDS PATCH: CityCitizens.HandleResourceConsumption (Food/Water only)");
+                }
+                MethodInfo tick = AccessTools.Method(cityType, "TickHour", Type.EmptyTypes);
+                if (tick != null && tick.ReturnType == typeof(void))
+                {
+                    MethodInfo cb = typeof(ResourceTweaks).GetMethod("CitizenNeedsHourPostfix", BindingFlags.NonPublic | BindingFlags.Static);
+                    harmony.Patch(tick, postfix: new HarmonyMethod(cb));
+                    citizenNeedsStateHooks++;
+                    Logger.LogInfo("CITIZEN NEEDS PATCH: CityCitizens.TickHour satisfaction maintenance");
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning("CITIZEN NEEDS: state patch skipped: " + ex.GetBaseException().Message);
+            }
+        }
+
+        private static bool CitizenConsumptionPrefix(object __instance, object[] __args)
+        {
+            if (active == null || __instance == null || __args == null || __args.Length != 9) return true;
+            bool noFood = active.citizenNoHunger != null && active.citizenNoHunger.Value;
+            bool noWater = active.citizenNoThirst != null && active.citizenNoThirst.Value;
+            if (!noFood && !noWater) return true;
+            try
+            {
+                object resource = __args[1];
+                bool food = noFood && resource != null &&
+                    object.ReferenceEquals(resource, citizenFoodResourceField.GetValue(__instance));
+                bool water = noWater && resource != null &&
+                    object.ReferenceEquals(resource, citizenWaterResourceField.GetValue(__instance));
+                if (!food && !water) return true;
+                object citizen = __args[0];
+                if (citizen == null) return true;
+                SatisfyCitizenNeed(citizen, food ? citizenFoodConsumptionField : citizenWaterConsumptionField);
+                // A ref CitizenConsumption may be copied back by Harmony; keep it consistent.
+                if (__args[5] != null)
+                {
+                    object record = __args[5];
+                    MarkNeedSatisfied(ref record);
+                    __args[5] = record;
+                }
+                needsSuppressedCalls++;
+                return false; // Only skip Food or Water payment. Leave all other resources vanilla.
+            }
+            catch (Exception ex)
+            {
+                if (!needsPatchLogged)
+                {
+                    needsPatchLogged = true;
+                    active.Logger.LogWarning("CITIZEN NEEDS: consume fallback to vanilla: " + ex.GetBaseException().Message);
+                }
+                return true;
+            }
+        }
+
+        private static void CitizenNeedsHourPostfix(object __instance)
+        {
+            if (active == null || __instance == null || cityCitizensListField == null) return;
+            bool noFood = active.citizenNoHunger != null && active.citizenNoHunger.Value;
+            bool noWater = active.citizenNoThirst != null && active.citizenNoThirst.Value;
+            if (!noFood && !noWater) return;
+            try
+            {
+                IEnumerable citizens = cityCitizensListField.GetValue(__instance) as IEnumerable;
+                if (citizens == null) return;
+                foreach (object citizen in citizens)
+                {
+                    if (citizen == null) continue;
+                    if (noFood) SatisfyCitizenNeed(citizen, citizenFoodConsumptionField);
+                    if (noWater) SatisfyCitizenNeed(citizen, citizenWaterConsumptionField);
+                }
+            }
+            catch (Exception ex)
+            {
+                if (!needsPatchLogged)
+                {
+                    needsPatchLogged = true;
+                    active.Logger.LogWarning("CITIZEN NEEDS: hourly satisfaction update skipped: " + ex.GetBaseException().Message);
+                }
+            }
+        }
+
+        private static void SatisfyCitizenNeed(object citizen, FieldInfo field)
+        {
+            if (citizen == null || field == null) return;
+            object record = field.GetValue(citizen); // boxed value-type copy
+            if (record == null) return;
+            MarkNeedSatisfied(ref record);
+            field.SetValue(citizen, record);
+        }
+
+        private static void MarkNeedSatisfied(ref object record)
+        {
+            if (record == null || needSatisfiedField == null) return;
+            needSatisfiedField.SetValue(record, true);
+            int target = needTargetField != null ? Convert.ToInt32(needTargetField.GetValue(record)) : 0;
+            if (target <= 0 && needTargetField != null)
+            {
+                target = 1;
+                needTargetField.SetValue(record, 1);
+            }
+            if (needChargeField != null)
+            {
+                int perUnit = 1;
+                if (needChargePerUnitField != null)
+                    perUnit = Math.Max(1, Convert.ToInt32(needChargePerUnitField.GetValue(record)));
+                long charge = (long)target * perUnit;
+                needChargeField.SetValue(record, (int)Math.Min(int.MaxValue, charge));
+            }
+        }
+
+        private static void CitizenMovementFloat(ref float __result)
+        {
+            if (active == null || !active.citizenSpeedEnabled.Value || __result <= 0f) return;
+            __result = Math.Min(100f, __result * Mathf.Clamp(active.citizenSpeedMultiplier.Value, 1, 5));
+        }
+
+        private static void CitizenCarryCapacityPostfix(ref int __result)
+        {
+            ResourceTweaks mod = active;
+            if (mod == null || mod.citizenCarryEnabled == null || !mod.citizenCarryEnabled.Value || __result <= 0) return;
+            int factor = Math.Max(1, Math.Min(50, mod.citizenCarryMultiplier.Value));
+            // Preserve getter semantics and avoid signed int overflow.
+            __result = (int)Math.Min(1000000L, (long)__result * factor);
+        }
+
+        private void ScanRecruitmentSignature(bool verbose)
+        {
+            Type cityType = AccessTools.TypeByName("CityCitizens");
+            Type groupType = AccessTools.TypeByName("SocialGroup");
+            if (cityType == null || groupType == null) return;
+            MethodInfo method = AccessTools.Method(cityType, "AddCitizen", new[] { groupType });
+            if (method != null && method.ReturnType.Name == "Citizen" && !method.IsStatic)
+            {
+                citizenRecruitMethod = method;
+                citizenRecruitGroupType = groupType;
+                if (verbose) Logger.LogInfo("CITIZEN RECRUIT CANDIDATE: " + method);
+            }
+        }
+
+        private void ScanCitizenAPI()
+        {
+            string[] types = { "CityCitizens", "CityCitizenNeeds", "CityCitizenNeedsStats", "CityCitizenNeedsPoints",
+                "SocialGroup", "Citizen", "CitizenStats", "CitizenConsumption", "CityCitizenMovement",
+                "CitizenTaskConsumeResources" };
+            int lines = 0;
+            foreach (string typeName in types)
+            {
+                Type type = AccessTools.TypeByName(typeName);
+                if (type == null) { Logger.LogInfo("CITIZEN TYPE UNAVAILABLE: " + typeName); continue; }
+                Logger.LogInfo("CITIZEN TYPE: " + typeName + " base=" + (type.BaseType != null ? type.BaseType.Name : "none"));
+                foreach (FieldInfo field in type.GetFields(Flags))
+                { Logger.LogInfo("CITIZEN FIELD: " + typeName + "." + field.Name + " : " + field.FieldType); lines++; }
+                foreach (MethodInfo method in type.GetMethods(Flags | BindingFlags.DeclaredOnly))
+                { Logger.LogInfo("CITIZEN METHOD: " + typeName + "." + method); lines++; }
+            }
+            ScanRecruitmentSignature(true);
+            Logger.LogInfo("CITIZEN API SCAN COMPLETE: " + lines + " members; scan is read-only");
+            citizenStatus = "API scan written to LogOutput.log";
+        }
+
+        // The game keeps the actual population and the HUD-eligible (unlocked) groups
+        // separately. Native AddCitizen alone changes population but does not necessarily
+        // expose a previously locked group to the top-bar UI. Only run on explicit recruit.
+        private void RefreshRecruitedGroupHUD(object target)
+        {
+            if (revealRecruitedGroups == null || !revealRecruitedGroups.Value || target == null || citizenRecruitOwner == null) return;
+            try
+            {
+                Type type = citizenRecruitOwner.GetType();
+                MethodInfo update = AccessTools.Method(type, "UpdateUnlockedSocialGroups", Type.EmptyTypes);
+                if (update != null) update.Invoke(citizenRecruitOwner, null);
+                FieldInfo unlockedField = AccessTools.Field(type, "unlockedSocialGroups");
+                System.Collections.IList groups = unlockedField != null ? unlockedField.GetValue(citizenRecruitOwner) as System.Collections.IList : null;
+                if (groups == null)
+                {
+                    Logger.LogWarning("CITIZEN HUD: unlockedSocialGroups not accessible; no forced UI registration");
+                    return;
+                }
+                bool added = false;
+                if (!groups.Contains(target))
+                {
+                    groups.Add(target);
+                    added = true;
+                }
+                MethodInfo notify = AccessTools.Method(type, "NotifyCitizensChanged", Type.EmptyTypes);
+                if (notify != null) notify.Invoke(citizenRecruitOwner, null);
+                Logger.LogInfo("CITIZEN HUD: recruited group " + (added ? "added to unlocked list" : "already unlocked") + "; refresh notified; groupCount=" + groups.Count);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning("CITIZEN HUD: refresh failed safely: " + ex.GetBaseException().Message);
+            }
+        }
+
+        private void TryRecruitCitizens()
+        {
+            if (citizenRecruitMethod == null) ScanRecruitmentSignature(false);
+            if (citizenRecruitMethod == null)
+            {
+                citizenStatus = "Recruitment unavailable: native AddCitizen(SocialGroup) not found";
+                Logger.LogWarning("CITIZENS: " + citizenStatus);
+                return;
+            }
+            try
+            {
+                if (citizenRecruitOwner == null)
+                {
+                    Type ownerType = citizenRecruitMethod.DeclaringType;
+                    citizenRecruitOwner = UnityEngine.Object.FindObjectOfType(ownerType);
+                }
+                if (citizenRecruitOwner == null)
+                {
+                    citizenStatus = "CityCitizens manager not ready";
+                    return;
+                }
+                // Resolve the actual registered city social groups, not arbitrary
+                // assets with a coincidentally matching object name.
+                Type managerType = citizenRecruitOwner.GetType();
+                MethodInfo getGroups = AccessTools.Method(managerType, "get_SocialGroups", Type.EmptyTypes);
+                if (getGroups == null) getGroups = AccessTools.Method(managerType, "get_CitizenSocialGroups", Type.EmptyTypes);
+                System.Collections.IEnumerable registered = getGroups != null
+                    ? getGroups.Invoke(citizenRecruitOwner, null) as System.Collections.IEnumerable : null;
+                object target = null;
+                string requested = citizenGroups[citizenGroupIndex];
+                if (registered != null)
+                {
+                    foreach (object candidate in registered)
+                    {
+                        if (candidate == null || !citizenRecruitGroupType.IsInstanceOfType(candidate)) continue;
+                        Type t = candidate.GetType();
+                        PropertyInfo title = t.GetProperty("Title", Flags);
+                        PropertyInfo id = t.GetProperty("ID", Flags);
+                        string text = ((title != null ? title.GetValue(candidate, null) : null) ??
+                            (id != null ? id.GetValue(candidate, null) : null) ?? candidate.ToString()).ToString();
+                        if (text.IndexOf(requested, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            text.IndexOf(requested.TrimEnd('s'), StringComparison.OrdinalIgnoreCase) >= 0)
+                        { target = candidate; break; }
+                    }
+                }
+                if (target == null)
+                {
+                    citizenStatus = "Cannot identify registered " + requested + " social group";
+                    return;
+                }
+                MethodInfo getCount = AccessTools.Method(managerType, "get_CitizenCount", Type.EmptyTypes);
+                int before = getCount != null ? Convert.ToInt32(getCount.Invoke(citizenRecruitOwner, null)) : -1;
+                int created = 0;
+                for (int i = 0; i < Math.Min(25, Math.Max(1, citizenRecruitCount)); i++)
+                {
+                    object citizen = citizenRecruitMethod.Invoke(citizenRecruitOwner, new[] { target });
+                    if (citizen == null) break;
+                    created++;
+                }
+                int after = getCount != null ? Convert.ToInt32(getCount.Invoke(citizenRecruitOwner, null)) : -1;
+                if (created > 0) RefreshRecruitedGroupHUD(target);
+                citizenCallCount++;
+                citizenStatus = "Native AddCitizen returned " + created + "; population " + before + " -> " + after;
+                Logger.LogInfo("CITIZEN RECRUIT: " + requested + " " + citizenStatus);
+                if (before >= 0 && after <= before)
+                    Logger.LogWarning("CITIZEN RECRUIT: population unchanged; do not assume citizens were registered");
+            }
+            catch (Exception ex)
+            {
+                citizenStatus = "Recruitment rejected: " + ex.GetBaseException().Message;
+                Logger.LogWarning("CITIZENS: " + citizenStatus);
+            }
+        }
+
+        private void DrawCitizensTab()
+        {
+            GUI.Label(new Rect(19, 113, 520, 29), "CITIZEN TWEAKS", headingStyle);
+            GUI.Label(new Rect(20, 141, 523, 23), "Customize your citizens.", mutedStyle);
+            bool changed = false;
+            changed |= DrawCitizenToggle(169, "Maximum Happiness", citizenMaxHappiness);
+            changed |= DrawCitizenToggle(204, "No Food Required", citizenNoHunger);
+            changed |= DrawCitizenToggle(239, "No Water Required", citizenNoThirst);
+            changed |= DrawCitizenToggle(274, "Movement Speed", citizenSpeedEnabled);
+            changed |= DrawCitizenPresets(307, "Move", citizenSpeedMultiplier, new[] { 1, 2, 3, 5 });
+            changed |= DrawCitizenToggle(342, "Work Speed (resource jobs)", citizenWorkSpeedEnabled);
+            changed |= DrawCitizenPresets(375, "Work", citizenWorkSpeedMultiplier, new[] { 1, 2, 5, 10, 25, 50 });
+            changed |= DrawCitizenToggle(410, "Carry Capacity", citizenCarryEnabled);
+            changed |= DrawCitizenPresets(443, "Carry", citizenCarryMultiplier, new[] { 1, 2, 5, 10, 25, 50 });
+            GUI.DrawTexture(new Rect(18, 480, 526, 1), borderTex);
+            GUI.Label(new Rect(20, 488, 90, 24), "Recruit", bodyStyle);
+            if (GUI.Button(new Rect(108, 486, 143, 28), citizenGroups[citizenGroupIndex], buttonStyle))
+                citizenGroupIndex = (citizenGroupIndex + 1) % citizenGroups.Length;
+            if (GUI.Button(new Rect(259, 486, 76, 28), "+" + citizenRecruitCount, buttonStyle))
+                citizenRecruitCount = citizenRecruitCount == 1 ? 5 : citizenRecruitCount == 5 ? 10 : citizenRecruitCount == 10 ? 25 : 1;
+            if (GUI.Button(new Rect(343, 486, 201, 28), "ADD CITIZENS", primaryStyle)) TryRecruitCitizens();
+            if (changed) try { Config.Save(); } catch (Exception ex) { Logger.LogWarning("CITIZEN SETTINGS SAVE FAILED: " + ex.Message); }
+            GUI.DrawTexture(new Rect(18, 527, 526, 1), borderTex);
+            GUI.Label(new Rect(20, 540, 520, 34),
+                "Work speed affects resource production and stacks with Output speed.", mutedStyle);
+        }
+
+        private bool DrawCitizenPresets(int y, string title, ConfigEntry<int> option, int[] values)
+        {
+            GUI.Label(new Rect(20, y + 2, 113, 23), title, bodyStyle);
+            bool changed = false;
+            int cellWidth = values.Length == 6 ? 65 : 68;
+            int spacing = values.Length == 6 ? 66 : 73;
+            for (int i = 0; i < values.Length; i++)
+            {
+                int value = values[i];
+                if (GUI.Button(new Rect(145 + i * spacing, y, cellWidth, 25), value + "x",
+                    option.Value == value ? primaryStyle : presetStyle))
+                { option.Value = value; changed = true; }
+            }
+            return changed;
+        }
+        private bool DrawCitizenToggle(int y, string title, ConfigEntry<bool> option)
+        {
+            GUI.Label(new Rect(22, y, 366, 29), title, bodyStyle);
+            bool v = option.Value;
+            if (GUI.Button(new Rect(415, y, 126, 28), v ? "ON [X]" : "OFF", v ? primaryStyle : buttonStyle))
+            { option.Value = !v; return true; }
+            return false;
         }
 
         private void DrawConstructionTab()
         {
-            GUI.Label(new Rect(19, 121, 520, 29), "CONSTRUCTION TWEAKS  /  GAME OVERRIDES", headingStyle);
+            GUI.Label(new Rect(19, 121, 520, 29), "CONSTRUCTION TWEAKS", headingStyle);
             GUI.Label(new Rect(19, 157, 520, 43),
-                "Direct construction hooks: free resource checks + force complete.\n" +
-                "Both enabled by default. Changes save automatically to BepInEx config.", bodyStyle);
+                "Build instantly or without materials.", bodyStyle);
             // Draw actual buttons rather than GUI.Toggle with a GUI.skin.label-based
             // style: that combination hid the checkbox graphic in previous builds.
             GUI.Label(new Rect(23, 211, 360, 34), "Instant Construction", bodyStyle);
@@ -1738,14 +2210,9 @@ namespace Sarakiel.AllWillFall
                     Logger.LogWarning("CONSTRUCTION CONFIG SAVE FAILED: " + ex.Message);
                 }
             }
-            if (GUI.Button(new Rect(19, 321, 526, 39), "SCAN CONSTRUCTION API  /  WRITE LOG", primaryStyle))
-                ScanConstructionAPI();
-            GUI.DrawTexture(new Rect(18, 385, 528, 1), borderTex);
-            GUI.Label(new Rect(19, 399, 526, 78),
-                "Game override getters: " + constructionOverridesPatched + "/2; direct hooks: " + constructionDirectPatched + "/5" +
-                "\nTry a NEW Water Storage and Food Storage.\n" +
-                "Toggle settings are remembered between launches.\n" +
-                "Use a backup save when experimenting with construction.", mutedStyle);
+            GUI.DrawTexture(new Rect(18, 327, 528, 1), borderTex);
+            GUI.Label(new Rect(20, 340, 520, 40),
+                "Changes are saved automatically.", mutedStyle);
         }
 
         private void ScanConstructionAPI()

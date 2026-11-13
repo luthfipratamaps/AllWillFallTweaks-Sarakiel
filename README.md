@@ -1,27 +1,33 @@
-# All Will Fall Tweaks v0.8.3.1 — Resource Production Speed Experiment
+# All Will Fall Tweaks v0.9.5 — Stabilization
 
-Based on the proven v0.8.2.2 project. Production yield (confirmed working by user) and all existing resources, capacity, construction, research, input, and scan code are retained.
+Cleanup of the user-confirmed working v0.9.4 build. **Back up the v0.9.4 DLL and game save before installing.**
 
-## Changes
+## Player-facing UI
 
-- Harmony postfix on actual `WorkProvider.get_WorkInterval(): float` found in v0.8.2 production scan.
-- Speed applies only to work providers whose `producers` list contains a `ResourceProducer`, protecting research and unrelated work.
-- Positive-only identity cache avoids repeated reflection for known producers; cache reset on scene change.
-- User-selected speed divisor (1–25×); minimum effective WorkInterval is 0.1 (in game's interval units).
-- Existing UI presets and settings persistence retained. Version display corrected to 0.8.3.
+Press **F8**. Six tabs: Resources, Capacity, Build, Research, Output, Citizens.
+
+- Removed all obsolete API scan buttons and technical hook counters from the GUI.
+- Removed development-only and experimental labels from player-facing controls.
+- Retained **Resources → Refresh** for manual refresh and capacity discovery.
+- Retained independently configurable options and persistent BepInEx settings.
+
+## Performance
+
+- **Full scene storage discovery runs once when CityResourceManager first becomes ready** for each loaded city; capacity multipliers are applied in the same pass.
+- Lightweight registry-only updates occur at `BackgroundScanIntervalSeconds` (default 5 seconds).
+- **Removed the recurring 30-second full scene fallback**, avoiding `Resources.FindObjectsOfTypeAll` during ordinary gameplay.
+- Full discovery remains available via **Resources → Refresh**.
+- Unnecessary performance-timing stopwatch allocations removed from the scheduled scans.
+- Per-storage informational logs are suppressed unless `[Diagnostics] VerboseLogging = true`.
+
+If a building does not appear in the city's registry after construction, press Resources → Refresh once. The scan-on-city-load behavior is unchanged.
+
+## Existing features
+
+Resources, capacity, instant/free construction, instant/free research, production yield/speed, citizen happiness and needs, recruitment/HUD, movement speed, work speed and carry capacity are inherited from v0.9.4.
 
 ## Build and install
 
-Use `build.cmd` and then `install.cmd`. Scripts reference managed libraries from `C:\Games\All Will Fall`, including `ScriptsAssembly.dll`, `APC.FixedDataTypes.dll`, and `Unity.Collections.dll`. Modify `config.ps1` if the game is elsewhere.
+Set the game folder in `config.ps1` if needed, run `build.cmd` followed by `install.cmd`. Uses the game's installed managed DLLs. No proprietary DLLs redistributed.
 
-## Testing on a backup save
-
-With Yield OFF, Speed ON at 2×, assign workers to a production building and time a completed cycle. Compare with Speed OFF at the same working conditions. The UI may retain the base duration even when actual cycle progress is accelerated. Then test Yield ON and Speed ON together. Inspect `LogOutput.log` for `PRODUCTION SPEED PATCH` and GUI `speed` applied-call count.
-
-**Experimental:** This getter may control only some of the game's production calculations; a successfully installed patch does not guarantee the cycle itself accelerates. Don't enable 25× initially; assess performance and save consistency first.
-
-**Build verification:** package/source checked here; Windows game DLL compilation and in-game results not verified.
-
-## v0.8.3.1 compiler dependency fix
-
-Added the game-provided `APC.Stats.dll` to both the PowerShell compiler references and the MSBuild project. `WorkProvider` implements `IStatsUserComponent<BuildingStats>` from that assembly. No production gameplay behavior changed.
+**Verification:** static source/ZIP checks performed; this build still needs a Windows compilation and in-game regression test.
