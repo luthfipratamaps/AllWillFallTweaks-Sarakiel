@@ -1,6 +1,7 @@
-using System;
+﻿using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
 using BepInEx;
@@ -11,7 +12,7 @@ using UnityEngine.SceneManagement;
 
 namespace Sarakiel.AllWillFall
 {
-    [BepInPlugin("id.sarakiel.allwillfall.resourcetweaks", "All Will Fall - Resource Tweaks", "0.5.0")]
+    [BepInPlugin("id.sarakiel.allwillfall.resourcetweaks", "All Will Fall - Resource Tweaks", "0.6.5.1")]
     public class ResourceTweaks : BaseUnityPlugin
     {
         private readonly string[] names = { "Water", "Food", "Junk", "Wood", "Metal", "Sand", "Fuel", "Goods", "Tools" };
@@ -27,11 +28,56 @@ namespace Sarakiel.AllWillFall
         private ConfigEntry<int> storageMultiplier, housingMultiplier;
         private ConfigEntry<bool> enableWater, enableFood, enableFuel, enableWarehouse, enableHouse;
         private bool capacityTab;
+        private bool constructionTab;
+        private ConfigEntry<bool> instantConstructionRequested, freeConstructionRequested;
+        private bool constructionScanned;
+        private int constructionMethodCount;
+        private int constructionOverridesPatched;
+        private int constructionDirectPatched;
+        private readonly List<QueuedBuild> queuedConstruction = new List<QueuedBuild>();
+        private sealed class QueuedBuild { public CityConstruction city; public Buildable buildable; public float readyAt; }
         private ConfigEntry<bool> autoScanEnabled;
         private ConfigEntry<float> autoScanInterval;
         private ConfigEntry<bool> verboseDiagnostics;
         private int observedSceneHandle = int.MinValue;
         private float nextAutoScanAt;
+        private ConfigEntry<bool> performanceDiagnostics;
+        private ConfigEntry<float> slowOperationThresholdMs;
+        private float nextFrameHitchLogAt;
+        private float nextPerformanceSummaryAt;
+        private int observedFrameSpikes;
+        private float worstFrameMs;
+        private int scannedStorageRuns;
+        private float maxStorageScanMs;
+        private float maxCapacitySyncMs;
+        private int syncedCapacityRuns;
+        private float maxResourceRefreshMs;
+        private int resourceRefreshRuns;
+        private readonly Dictionary<Type, FieldInfo> capacityFieldCache = new Dictionary<Type, FieldInfo>();
+        private bool capacitySettingsDirty;
+        private int lastStorageMultiplier;
+        private bool lastWaterEnabled, lastFoodEnabled, lastFuelEnabled, lastWarehouseEnabled;
+
+        private void RememberCapacitySettings()
+        {
+            lastStorageMultiplier = storageMultiplier.Value;
+            lastWaterEnabled = enableWater.Value;
+            lastFoodEnabled = enableFood.Value;
+            lastFuelEnabled = enableFuel.Value;
+            lastWarehouseEnabled = enableWarehouse.Value;
+        }
+
+        private void DetectCapacitySettingsChange()
+        {
+            if (storageMultiplier.Value == lastStorageMultiplier &&
+                enableWater.Value == lastWaterEnabled &&
+                enableFood.Value == lastFoodEnabled &&
+                enableFuel.Value == lastFuelEnabled &&
+                enableWarehouse.Value == lastWarehouseEnabled) return;
+            RememberCapacitySettings();
+            capacitySettingsDirty = true;
+        }
+
         private int autoScanAttempts;
         private bool lastManagerReady;
 
@@ -72,6 +118,18 @@ namespace Sarakiel.AllWillFall
             autoScanEnabled = Config.Bind("Startup", "AutoScanOnCityLoad", true, "Automatically discover buildings/resources after loading a city. Manual Rescan is still available.");
             autoScanInterval = Config.Bind("Startup", "BackgroundScanIntervalSeconds", 5f, "Interval for discovering newly constructed storages (minimum 1 second).");
             verboseDiagnostics = Config.Bind("Diagnostics", "VerboseLogging", false, "Log resource reflection details, per-storage traces and scan attempts for troubleshooting.");
+            performanceDiagnostics = Config.Bind("Diagnostics", "PerformanceDiagnostics", true,
+                "Periodically report frame hitches and worst scan timings (no per-frame logging).");
+            slowOperationThresholdMs = Config.Bind("Diagnostics", "SlowOperationThresholdMs", 8f,
+                "Log a scan/synchronization immediately if it exceeds this many milliseconds.");
+            // Avoid ConfigEntryBase.SettingChanged: unavailable in some BepInEx 5 builds.
+            // Remember the initial settings; a cheap value comparison detects UI and
+            // external config changes without allocating delegates or using reflection.
+            RememberCapacitySettings();
+            instantConstructionRequested = Config.Bind("Construction", "InstantConstruction", true,
+                "Instantly complete new building construction. Changes in the F8 menu are saved to this config.");
+            freeConstructionRequested = Config.Bind("Construction", "FreeConstruction", true,
+                "Disable construction material requirements. Changes in the F8 menu are saved to this config.");
             amountText = Math.Max(1, Math.Min(1000000, defaultAmount.Value)).ToString();
             window.x = Mathf.Clamp(savedX.Value, 0, Mathf.Max(0, Screen.width - window.width));
             window.y = Mathf.Clamp(savedY.Value, 0, Mathf.Max(0, Screen.height - window.height));
@@ -100,7 +158,9 @@ namespace Sarakiel.AllWillFall
             InstallStrictMouseGuard();
             InstallNewInputGuard();
             InstallCapacityPatches();
-            ScanStorageInstances(true);
+            InstallConstructionOverrides();
+            InstallConstructionDirectPatches();
+            // City data is unavailable during Awake; defer scene scan to AutoScanCity.
             nextAutoScanAt = Time.unscaledTime + 1f;
         }
 
@@ -221,12 +281,18 @@ namespace Sarakiel.AllWillFall
 
         private void Update()
         {
+            ProcessQueuedConstruction();
             if (autoScanEnabled != null && autoScanEnabled.Value) AutoScanCity();
-            if (capacityPatched > 0)
+            // Five primitive comparisons; no Unity scene scan or allocations.
+            DetectCapacitySettingsChange();
+            // Do not wake the reflection-based capacity synchronizer every 0.65 s.
+            // It runs after city scans or immediately when its config changes.
+            if (capacitySettingsDirty)
             {
-                ScanStorageInstances(false);
+                capacitySettingsDirty = false;
                 ApplyStorageCapacities();
             }
+            DiagnoseFrameHitches();
             if (Input.GetKeyDown(toggleKey != null ? toggleKey.Value : KeyCode.F8))
             {
                 visible = !visible;
@@ -244,10 +310,12 @@ namespace Sarakiel.AllWillFall
             if (sceneHandle != observedSceneHandle)
             {
                 observedSceneHandle = sceneHandle;
+                queuedConstruction.Clear();
                 manager = null;
                 inspected = false;
                 diagnosticsWritten = false;
                 lastManagerReady = false;
+                capacitySettingsDirty = false;
                 counts.Clear();
                 storageKinds.Clear();
                 storageBaseCapacities.Clear();
@@ -276,9 +344,23 @@ namespace Sarakiel.AllWillFall
                     lastCountRefresh = -100f;
                 }
                 lastManagerReady = ready;
+                Stopwatch scanWatch = Stopwatch.StartNew();
                 ScanStorageInstances(true);
+                scanWatch.Stop();
+                RecordPerformance("Storage discovery", scanWatch.Elapsed.TotalMilliseconds, ref scannedStorageRuns, ref maxStorageScanMs);
+                Stopwatch syncWatch = Stopwatch.StartNew();
                 ApplyStorageCapacities();
-                if (ready) RefreshCounts();
+                syncWatch.Stop();
+                RecordPerformance("Capacity synchronization", syncWatch.Elapsed.TotalMilliseconds, ref syncedCapacityRuns, ref maxCapacitySyncMs);
+                // Resource count discovery is expensive; the counts aren't visible
+                // while F8 is closed. Refresh only when the Resources tab is shown.
+                if (ready && visible && !capacityTab && !constructionTab)
+                {
+                    Stopwatch resourceWatch = Stopwatch.StartNew();
+                    RefreshCounts();
+                    resourceWatch.Stop();
+                    RecordPerformance("Resource refresh", resourceWatch.Elapsed.TotalMilliseconds, ref resourceRefreshRuns, ref maxResourceRefreshMs);
+                }
                 autoScanAttempts++;
                 if (verboseDiagnostics.Value && (autoScanAttempts <= 3 || autoScanAttempts == 10))
                     Logger.LogInfo("AUTO SCAN: attempt=" + autoScanAttempts + " city=" + ready + " tracked=" + storageKinds.Count);
@@ -287,6 +369,45 @@ namespace Sarakiel.AllWillFall
             {
                 if (autoScanAttempts++ < 3) Logger.LogWarning("AUTO SCAN: retrying after " + ex.Message);
             }
+        }
+
+        private void RecordPerformance(string operation, double ms, ref int count, ref float max)
+        {
+            if (performanceDiagnostics == null || !performanceDiagnostics.Value) return;
+            count++;
+            if (ms > max) max = (float)ms;
+            if (ms >= Mathf.Max(1f, slowOperationThresholdMs.Value))
+                Logger.LogWarning("PERF SLOW: " + operation + " took " + ms.ToString("F1") + " ms");
+        }
+
+        private void DiagnoseFrameHitches()
+        {
+            if (performanceDiagnostics == null || !performanceDiagnostics.Value) return;
+            float now = Time.unscaledTime;
+            float ms = Time.unscaledDeltaTime * 1000f;
+            if (ms >= 90f)
+            {
+                observedFrameSpikes++;
+                if (ms > worstFrameMs) worstFrameMs = ms;
+                if (now >= nextFrameHitchLogAt)
+                {
+                    Logger.LogWarning("PERF FRAME HITCH: " + ms.ToString("F1") +
+                        " ms, trackedStorages=" + storageKinds.Count + ", queuedBuilds=" + queuedConstruction.Count);
+                    nextFrameHitchLogAt = now + 10f;
+                }
+            }
+            if (nextPerformanceSummaryAt == 0f) nextPerformanceSummaryAt = now + 30f;
+            if (now < nextPerformanceSummaryAt) return;
+            Logger.LogInfo("PERF SUMMARY (30s): frameSpikes>=90ms=" + observedFrameSpikes +
+                " worstFrame=" + worstFrameMs.ToString("F1") + "ms" +
+                " storageScans=" + scannedStorageRuns + " maxScan=" + maxStorageScanMs.ToString("F1") + "ms" +
+                " capacitySyncs=" + syncedCapacityRuns + " maxSync=" + maxCapacitySyncMs.ToString("F1") + "ms" +
+                " resourceRefreshes=" + resourceRefreshRuns + " maxRefresh=" + maxResourceRefreshMs.ToString("F1") + "ms");
+            nextPerformanceSummaryAt = now + 30f;
+            observedFrameSpikes = 0; worstFrameMs = 0;
+            scannedStorageRuns = 0; maxStorageScanMs = 0;
+            syncedCapacityRuns = 0; maxCapacitySyncMs = 0;
+            resourceRefreshRuns = 0; maxResourceRefreshMs = 0;
         }
 
         private void OnDisable() { SaveWindowPosition(); if (active == this) active = null; if (harmony != null) harmony.UnpatchSelf(); }
@@ -390,12 +511,14 @@ namespace Sarakiel.AllWillFall
         {
             GUI.DrawTexture(new Rect(0, 0, 564, 4), primaryTex);
             GUI.Label(new Rect(19, 14, 400, 29), "ALL WILL FALL  /  TWEAKS", headingStyle);
-            GUI.Label(new Rect(22, 42, 450, 17), "SARAKIEL  •  TWEAKS DASHBOARD   v0.5.0", subtitleStyle);
+            GUI.Label(new Rect(22, 42, 450, 17), "SARAKIEL  •  TWEAKS DASHBOARD   v0.6.5.1", subtitleStyle);
             if (GUI.Button(new Rect(516, 18, 30, 28), "×", closeStyle)) { visible = false; pointerCaptured = false; SaveWindowPosition(); }
             GUI.DrawTexture(new Rect(18, 69, 528, 1), borderTex);
-            if (GUI.Button(new Rect(18, 77, 259, 30), "RESOURCES", capacityTab ? buttonStyle : primaryStyle)) capacityTab = false;
-            if (GUI.Button(new Rect(286, 77, 260, 30), "BUILDING CAPACITY", capacityTab ? primaryStyle : buttonStyle)) capacityTab = true;
+            if (GUI.Button(new Rect(18, 77, 171, 30), "RESOURCES", !capacityTab && !constructionTab ? primaryStyle : buttonStyle)) { capacityTab = false; constructionTab = false; }
+            if (GUI.Button(new Rect(196, 77, 171, 30), "CAPACITY", capacityTab ? primaryStyle : buttonStyle)) { capacityTab = true; constructionTab = false; }
+            if (GUI.Button(new Rect(374, 77, 172, 30), "CONSTRUCTION", constructionTab ? primaryStyle : buttonStyle)) { constructionTab = true; capacityTab = false; }
             if (capacityTab) { DrawCapacityTab(); GUI.DragWindow(new Rect(0, 5, 500, 65)); return; }
+            if (constructionTab) { DrawConstructionTab(); GUI.DragWindow(new Rect(0, 5, 500, 65)); return; }
 
             GUI.Label(new Rect(19, 118, 85, 24), "ADD AMOUNT", mutedStyle);
             amountText = GUI.TextField(new Rect(113, 117, 133, 31), amountText, 8, inputStyle);
@@ -418,7 +541,8 @@ namespace Sarakiel.AllWillFall
                 GUI.Label(new Rect(x+104,y+5,55,21),count,numberStyle);
                 if (GUI.Button(new Rect(x+8,y+30,154,22),"+  ADD " + label.ToUpperInvariant(), buttonStyle)) Add(label);
             }
-            if (Time.realtimeSinceStartup - lastCountRefresh > 0.9f) RefreshCounts();
+            // Only the Resources tab requests stock updates (and never when F8 is closed).
+            if (Time.realtimeSinceStartup - lastCountRefresh > 1.5f) RefreshCounts();
             if (GUI.Button(new Rect(18, 395, 367, 38), "＋  ADD ALL NINE RESOURCES", primaryStyle))
             {
                 foreach (string name in names) Add(name);
@@ -506,9 +630,10 @@ namespace Sarakiel.AllWillFall
         {
             string kind;
             if (storageKinds.TryGetValue(targetStorage, out kind)) return kind;
-            // Refresh only after a missed lookup. Harmony patches may execute often.
-            ScanStorageInstances(false);
-            if (storageKinds.TryGetValue(targetStorage, out kind)) return kind;
+            // Storage.get_Capacity can be called many times per frame.
+            // Never traverse the scene from this hot getter. The scheduled city scan
+            // will discover and synchronize new storage instances safely.
+            // Unknown objects temporarily retain vanilla capacity.
             if (verboseDiagnostics.Value && unknownStorageLogged.Add(targetStorage) && unknownStorageLogged.Count <= 12)
             {
                 Logger.LogWarning("CAPACITY UNKNOWN STORAGE: " + targetStorage.GetType().FullName +
@@ -606,13 +731,10 @@ namespace Sarakiel.AllWillFall
         // completed. Updating the actual Storage.capacity field also makes the stock UI
         // and fullness bar use a consistent denominator, instead of only patching a getter.
         // Base values are stored separately: changing 10x to 5x never compounds.
-        private float nextCapacityApply;
         private readonly HashSet<object> appliedCapacityLog = new HashSet<object>(ReferenceEqualityComparer.Instance);
         private void ApplyStorageCapacities()
         {
-            if (Time.unscaledTime < nextCapacityApply) return;
-            nextCapacityApply = Time.unscaledTime + 0.65f;
-            foreach (var entry in storageKinds.ToArray())
+            foreach (var entry in storageKinds)
             {
                 object storage = entry.Key;
                 if (storage == null) continue;
@@ -626,7 +748,13 @@ namespace Sarakiel.AllWillFall
                 int desired = MultiplySafe(original, multiplier);
                 try
                 {
-                    FieldInfo field = storage.GetType().GetField("capacity", Flags);
+                    Type storageType = storage.GetType();
+                    FieldInfo field;
+                    if (!capacityFieldCache.TryGetValue(storageType, out field))
+                    {
+                        field = storageType.GetField("capacity", Flags);
+                        capacityFieldCache[storageType] = field;
+                    }
                     if (field == null || field.FieldType != typeof(int)) continue;
                     int current = (int)field.GetValue(storage);
                     if (current == desired) continue;
@@ -1004,6 +1132,231 @@ namespace Sarakiel.AllWillFall
                 foreach (var prop in t.GetProperties(Flags).Where(p => p.GetIndexParameters().Length == 0))
                     Logger.LogInfo("RESOURCE PROPERTY: " + t.Name + "." + prop.Name + " : " + prop.PropertyType);
             }
+        }
+
+        // v0.6.1: use game-provided construction override flags, not broad resource patches.
+        // Toggle booleans are off by default. The actual behavior of these game flags
+        // must be verified in-game with a backup save before calling them stable.
+        private void InstallConstructionOverrides()
+        {
+            try
+            {
+                if (harmony == null) harmony = new Harmony("id.sarakiel.allwillfall.resourcetweaks.ui");
+                Type cityConstruction = AccessTools.TypeByName("CityConstruction");
+                if (cityConstruction == null)
+                {
+                    Logger.LogWarning("CONSTRUCTION PATCH: CityConstruction unavailable");
+                    return;
+                }
+                string[] names = { "get_InstantBuildOverride", "get_FreeBuildOverride" };
+                string[] callbacks = { "InstantBuildOverridePostfix", "FreeBuildOverridePostfix" };
+                for (int i = 0; i < names.Length; i++)
+                {
+                    MethodInfo getter = AccessTools.Method(cityConstruction, names[i], Type.EmptyTypes);
+                    MethodInfo callback = typeof(ResourceTweaks).GetMethod(callbacks[i], BindingFlags.Static | BindingFlags.NonPublic);
+                    if (getter == null || getter.ReturnType != typeof(bool) || callback == null)
+                    {
+                        Logger.LogWarning("CONSTRUCTION PATCH: incompatible or missing " + names[i]);
+                        continue;
+                    }
+                    try
+                    {
+                        harmony.Patch(getter, postfix: new HarmonyMethod(callback));
+                        constructionOverridesPatched++;
+                        Logger.LogInfo("CONSTRUCTION PATCH: CityConstruction." + names[i]);
+                    }
+                    catch (Exception ex) { Logger.LogWarning("CONSTRUCTION PATCH FAILED: " + names[i] + ": " + ex.Message); }
+                }
+                Logger.LogInfo("CONSTRUCTION: " + constructionOverridesPatched + "/2 override getters patched");
+            }
+            catch (Exception ex) { Logger.LogError("CONSTRUCTION PATCH ERROR: " + ex); }
+        }
+
+        private static void InstantBuildOverridePostfix(ref bool __result)
+        {
+            if (active != null && active.instantConstructionRequested != null && active.instantConstructionRequested.Value)
+                __result = true;
+        }
+
+        private static void FreeBuildOverridePostfix(ref bool __result)
+        {
+            if (active != null && active.freeConstructionRequested != null && active.freeConstructionRequested.Value)
+                __result = true;
+        }
+
+        // v0.6.2 direct hooks. ScriptsAssembly.dll is referenced at COMPILE TIME,
+        // and is ALWAYS loaded from the game's own Managed directory at runtime.
+        // No game binaries are bundled with the mod.
+        private void InstallConstructionDirectPatches()
+        {
+            if (harmony == null) harmony = new Harmony("id.sarakiel.allwillfall.resourcetweaks.ui");
+            DirectPatch(typeof(CityConstruction), "IsInstantlyBuildable", new [] { typeof(Buildable) }, "IsInstantlyBuildablePostfix");
+            DirectPatch(typeof(CityConstruction), "CreateConstruction", null, "CreateConstructionPostfix");
+            DirectPatch(typeof(ConstructionBuildable), "get_ConstructionResourcesEnoughToConstruct", Type.EmptyTypes, "ResourcesEnoughPostfix");
+            DirectPatch(typeof(ConstructionBuildable), "GetRemainingRequiredResources", Type.EmptyTypes, "RemainingResourcesPostfix");
+            DirectPatch(typeof(ConstructionBuildable), "NeedsResourceBringer", Type.EmptyTypes, "NeedsResourceBringerPostfix");
+            Logger.LogInfo("CONSTRUCTION DIRECT: " + constructionDirectPatched + "/5 hooks patched");
+        }
+
+        private void DirectPatch(Type type, string methodName, Type[] parameterTypes, string callback)
+        {
+            try
+            {
+                MethodInfo target = parameterTypes == null ? type.GetMethods(Flags).FirstOrDefault(m => m.Name == methodName) : AccessTools.Method(type, methodName, parameterTypes);
+                MethodInfo post = typeof(ResourceTweaks).GetMethod(callback, BindingFlags.NonPublic | BindingFlags.Static);
+                if (target == null || post == null) { Logger.LogWarning("CONSTRUCTION DIRECT: missing " + type.Name + "." + methodName); return; }
+                harmony.Patch(target, postfix: new HarmonyMethod(post));
+                constructionDirectPatched++;
+                Logger.LogInfo("CONSTRUCTION DIRECT PATCH: " + type.Name + "." + methodName);
+            }
+            catch (Exception ex) { Logger.LogWarning("CONSTRUCTION DIRECT PATCH FAILED: " + type.Name + "." + methodName + " " + ex); }
+        }
+
+        private static bool WantsFree()
+        {
+            return active != null && active.freeConstructionRequested != null && active.freeConstructionRequested.Value;
+        }
+        private static bool WantsInstant()
+        {
+            return active != null && active.instantConstructionRequested != null && active.instantConstructionRequested.Value;
+        }
+        private static void IsInstantlyBuildablePostfix(ref bool __result)
+        {
+            if (WantsInstant()) __result = true;
+        }
+        private static void ResourcesEnoughPostfix(ref bool __result)
+        {
+            if (WantsFree()) __result = true;
+        }
+        private static void RemainingResourcesPostfix(ref ResourceBlock __result)
+        {
+            if (WantsFree()) __result = new ResourceBlock();
+        }
+        private static void NeedsResourceBringerPostfix(ref bool __result)
+        {
+            if (WantsFree()) __result = false;
+        }
+        private static void CreateConstructionPostfix(CityConstruction __instance, ConstructionBuildable __result)
+        {
+            if (!WantsInstant() || active == null || __instance == null || __result == null) return;
+            try
+            {
+                if (!__result.ConstructionConstructing || __result.buildable == null) return;
+                active.EnqueueConstruction(__instance, __result.buildable);
+            }
+            catch (Exception ex) { active.Logger.LogWarning("CONSTRUCTION QUEUE: " + ex.Message); }
+        }
+        private void EnqueueConstruction(CityConstruction city, Buildable buildable)
+        {
+            if (queuedConstruction.Any(q => object.ReferenceEquals(q.buildable, buildable))) return;
+            queuedConstruction.Add(new QueuedBuild { city = city, buildable = buildable, readyAt = Time.unscaledTime + 0.12f });
+            Logger.LogInfo("CONSTRUCTION QUEUED: " + buildable.ToString());
+        }
+        private void ProcessQueuedConstruction()
+        {
+            if (queuedConstruction.Count == 0) return;
+            if (!WantsInstant()) { queuedConstruction.Clear(); return; }
+            for (int i = queuedConstruction.Count - 1; i >= 0; i--)
+            {
+                QueuedBuild queued = queuedConstruction[i];
+                if (Time.unscaledTime < queued.readyAt) continue;
+                queuedConstruction.RemoveAt(i);
+                try
+                {
+                    if (queued.city == null || queued.buildable == null) continue;
+                    ConstructionBuildable job = queued.city.GetConstruction(queued.buildable);
+                    if (job == null || !job.ConstructionConstructing) continue;
+                    queued.city.ForceCompleteConstructions(queued.buildable);
+                    Logger.LogInfo("CONSTRUCTION FORCED COMPLETE: " + queued.buildable.ToString());
+                }
+                catch (Exception ex) { Logger.LogError("CONSTRUCTION FORCE FAILED: " + ex); }
+            }
+        }
+
+        private void DrawConstructionTab()
+        {
+            GUI.Label(new Rect(19, 121, 520, 29), "CONSTRUCTION TWEAKS  /  GAME OVERRIDES", headingStyle);
+            GUI.Label(new Rect(19, 157, 520, 43),
+                "Direct construction hooks: free resource checks + force complete.\n" +
+                "Both enabled by default. Changes save automatically to BepInEx config.", bodyStyle);
+            // Draw actual buttons rather than GUI.Toggle with a GUI.skin.label-based
+            // style: that combination hid the checkbox graphic in previous builds.
+            GUI.Label(new Rect(23, 211, 360, 34), "Instant Construction", bodyStyle);
+            bool nextInstant = instantConstructionRequested.Value;
+            if (GUI.Button(new Rect(413, 210, 128, 34),
+                nextInstant ? "ON  [X]" : "OFF", nextInstant ? primaryStyle : buttonStyle))
+                nextInstant = !nextInstant;
+            GUI.Label(new Rect(23, 258, 365, 34), "Free Construction / No Material Cost", bodyStyle);
+            bool nextFree = freeConstructionRequested.Value;
+            if (GUI.Button(new Rect(413, 257, 128, 34),
+                nextFree ? "ON  [X]" : "OFF", nextFree ? primaryStyle : buttonStyle))
+                nextFree = !nextFree;
+            // Never write from every OnGUI event: only persist actual user changes.
+            if (nextInstant != instantConstructionRequested.Value || nextFree != freeConstructionRequested.Value)
+            {
+                instantConstructionRequested.Value = nextInstant;
+                freeConstructionRequested.Value = nextFree;
+                try
+                {
+                    Config.Save();
+                    status = "Construction settings saved";
+                    Logger.LogInfo("CONSTRUCTION SETTINGS SAVED: instant=" + nextInstant + " free=" + nextFree);
+                }
+                catch (Exception ex)
+                {
+                    status = "Could not save construction settings; see log";
+                    Logger.LogWarning("CONSTRUCTION CONFIG SAVE FAILED: " + ex.Message);
+                }
+            }
+            if (GUI.Button(new Rect(19, 321, 526, 39), "SCAN CONSTRUCTION API  /  WRITE LOG", primaryStyle))
+                ScanConstructionAPI();
+            GUI.DrawTexture(new Rect(18, 385, 528, 1), borderTex);
+            GUI.Label(new Rect(19, 399, 526, 78),
+                "Game override getters: " + constructionOverridesPatched + "/2; direct hooks: " + constructionDirectPatched + "/5" +
+                "\nTry a NEW Water Storage and Food Storage.\n" +
+                "Toggle settings are remembered between launches.\n" +
+                "Use a backup save when experimenting with construction.", mutedStyle);
+        }
+
+        private void ScanConstructionAPI()
+        {
+            try
+            {
+                var asm = AppDomain.CurrentDomain.GetAssemblies().FirstOrDefault(a => a.GetName().Name == "ScriptsAssembly");
+                if (asm == null) { status = "ScriptsAssembly not loaded"; Logger.LogWarning("CONSTRUCTION API: assembly not loaded"); return; }
+                int methods = 0;
+                foreach (var type in SafeTypes(asm))
+                {
+                    if (type == null) continue;
+                    string tn = type.Name;
+                    bool target = tn.IndexOf("Construction", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                  tn.IndexOf("ConstructBuildable", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                  tn == "Buildable" || tn == "CityBuildingManager" || tn == "CityResourceManager";
+                    if (!target) continue;
+                    Logger.LogInfo("CONSTRUCTION TYPE: " + type.FullName + " : " + type.BaseType);
+                    foreach (var field in type.GetFields(Flags | BindingFlags.DeclaredOnly))
+                    {
+                        if (field.Name.IndexOf("cost", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            field.Name.IndexOf("resource", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            field.Name.IndexOf("progress", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            field.Name.IndexOf("build", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            field.Name.IndexOf("instant", StringComparison.OrdinalIgnoreCase) >= 0)
+                            Logger.LogInfo("CONSTRUCTION FIELD: " + tn + "." + field.Name + " : " + field.FieldType);
+                    }
+                    foreach (var method in type.GetMethods(Flags | BindingFlags.DeclaredOnly))
+                    {
+                        if (method.IsSpecialName && !method.Name.StartsWith("get_")) continue;
+                        if (tn == "CityResourceManager" && method.Name.IndexOf("construction", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                        Logger.LogInfo("CONSTRUCTION API: " + type.Name + "." + method);
+                        methods++;
+                    }
+                }
+                constructionMethodCount = methods;
+                constructionScanned = true;
+                status = "Construction signatures logged: " + methods;
+                Logger.LogInfo("CONSTRUCTION SCAN COMPLETE: " + methods + " methods. No gameplay mutations performed.");
+            }
+            catch (Exception ex) { status = "Construction scan failed; check log"; Logger.LogError("CONSTRUCTION SCAN FAILED: " + ex); }
         }
     }
 }

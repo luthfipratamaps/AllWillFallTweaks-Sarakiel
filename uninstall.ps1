@@ -1,9 +1,6 @@
-$ErrorActionPreference = 'Stop'
+$ErrorActionPreference='Stop'
 . "$PSScriptRoot\config.ps1"
-try {
-    $target = Join-Path $PluginDir "$ModName.dll"
-    if (Test-Path -LiteralPath $target) {
-        Remove-Item -Force -LiteralPath $target
-        Write-Host "[OK] Removed: $target" -ForegroundColor Green
-    } else { Write-Host "Not installed: $target" }
-} catch { Write-Host "[ERROR] $($_.Exception.Message)" -ForegroundColor Red; exit 1 }
+$target=Join-Path $PluginsDir 'AllWillFallTweaks.dll'
+if(Test-Path $target) { Remove-Item $target; Write-Host "[REMOVED] $target" }
+else { Write-Host 'Plugin not installed.' }
+Write-Host 'Existing configuration preserved.'

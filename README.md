@@ -1,27 +1,15 @@
-# All Will Fall Tweaks — Sarakiel v0.5.0
+# All Will Fall Tweaks v0.6.5.1 — Performance Diagnostics
 
-BepInEx 5 (Mono) mod. Stable-feature cleanup release based on v0.4.6, with no changes to the verified resource, housing, storage-capacity or input-guard algorithms.
+BepInEx 5 mod for All Will Fall. Retains v0.6.4 resources, 10x storage, 5x housing, instant/free construction, F8 dashboard and persisted config settings.
 
-## Install and build
+## Build / install
+Run `build.cmd`, then `install.cmd`. Scripts use game DLLs from the local All Will Fall installation; no game binaries are included. Back up saves and your working v0.6.4 plugin.
 
-- Game: `C:\Games\All Will Fall`
-- Plugins: `C:\Games\All Will Fall\BepInEx\plugins`
-- Double-click `install.cmd` to build and install (requires the same Windows compiler and game files as v0.4.6).
-- `build.cmd` builds only; `release.cmd` creates a distributable ZIP; `uninstall.cmd` removes the mod DLL.
-- Press **F8** for the dashboard; the city and newly constructed buildings are scanned automatically.
+## Performance changes
+Capacity synchronization no longer runs on the 0.65-second timer. The background discovery interval remains configurable (default 5 seconds). Storage capacities sync on scheduled city discovery and after capacity settings change. Stock refresh is only requested when the Resources tab is visible.
 
-## Default settings
+## Diagnostics
+BepInEx config `[Diagnostics]`: `PerformanceDiagnostics = true` and `SlowOperationThresholdMs = 8`. The game log includes `PERF SLOW`, `PERF FRAME HITCH` (at most one immediate hitch warning per 10 seconds), and `PERF SUMMARY (30s)` reports. They measure wall-clock duration of mod scans; frame hitches can originate in the base game or other systems. Test with F8 closed for ~60 seconds and share the log. Disable performance diagnostics after testing to reduce logging.
 
-The plugin *generates* its config under `BepInEx\config\id.sarakiel.allwillfall.resourcetweaks.cfg` using `Config.Bind` defaults on first launch. A short reference copy is provided at `defaults/default-settings.cfg.example`.
-
-- Storage multiplier 10x, house multiplier 5x.
-- Water, food, fuel, general warehouse, and housing enabled.
-- Auto scan enabled, repeat interval 5 seconds.
-- Both mouse input guards enabled. F8 menu; resource amount 100; window X=110, Y=90.
-- Verbose diagnostics disabled by default.
-
-**Existing configs are retained**: BepInEx does not overwrite your saved preferences when a plugin version changes. To regenerate *all* factory defaults, first back up or rename the existing `.cfg` while the game is closed, then launch the game.
-
-## Notes
-
-Capacity adjustments can affect saves; test on a backup city. Changes to an in-use storage may be saved as in-game values. The game must be installed locally for compilation. This package hasn't been tested on your Windows system.
+## Limitations
+Performance work was not compiled or tested in a Windows game session. If errors occur, revert to v0.6.4.

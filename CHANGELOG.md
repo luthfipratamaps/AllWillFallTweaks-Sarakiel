@@ -1,13 +1,19 @@
 # Changelog
 
-## v0.5.0 — Clean baseline & default configuration
+## v0.6.5.1 — BepInEx 5 compatibility build fix
+- Fixed CS1061: removed invalid `ConfigEntryBase.SettingChanged` subscription.
+- Detect capacity setting changes with five primitive comparisons during `Update()`; synchronization only runs when settings differ.
+- No other gameplay hooks or performance diagnostics modified.
+- This fixes the reported compile error; local game compilation is not available in this environment.
 
-- Matched fresh-generated BepInEx configuration to the user-tested v0.4.6 settings.
-- Fresh-session default resource amount is now 100 (previously 1000).
-- Added optional `[Diagnostics] VerboseLogging`, default `false`; hides repeated reflection and per-storage tracing except when troubleshooting.
-- Preserved v0.4.6 capacity sync, auto-scan, resource injection, modern UI and Input System guard.
-- Retained existing configs on installation; added sample defaults and updated documentation.
+# Changelog
 
-## v0.4.6
+## v0.6.5 — Performance diagnostics
+- Removed periodic 0.65-second reflection capacity synchronization. Capacities now synchronize on city discovery and when capacity settings change.
+- Deferred startup storage scans until the city is ready.
+- Avoided background resource count refresh when the Resources tab is hidden.
+- Cached reflection metadata for the Storage.capacity field, and removed per-sync dictionary snapshot allocations.
+- Added `Diagnostics.PerformanceDiagnostics=true` and `SlowOperationThresholdMs=8` with slow-operation warnings, rate-limited frame hitch warnings and 30-second aggregate performance summaries.
+- Preserved GUI, construction patches, config persistence, auto-scanning and capacity features.
 
-- Auto scan after city load, retries and background discovery.
+**Experimental:** no game-side FPS benchmark was run. Diagnostics are intended to confirm the source of residual lag.

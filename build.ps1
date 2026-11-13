@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 . "$PSScriptRoot\config.ps1"
 try {
@@ -48,6 +48,16 @@ try {
     }
     Write-Host "[INFO] netstandard reference: $netstandard"
     $refFiles += $netstandard
+    $refFiles += $scriptDll
+
+    # ScriptsAssembly references GraphProcessor.BaseNode. CSC needs its defining
+    # assembly even when our source only touches construction-related types.
+    $nodeGraph = Join-Path $managed 'com.alelievr.NodeGraphProcessor.Runtime.dll'
+    if (-not (Test-Path -LiteralPath $nodeGraph)) {
+        throw "Missing required game dependency: $nodeGraph. Verify game files; do not download random DLLs."
+    }
+    Write-Host "[INFO] NodeGraphProcessor reference: $nodeGraph"
+    $refFiles += $nodeGraph
 
     # A SINGLE-LINE, ANSI response file works reliably with the legacy .NET Framework csc.
     # v0.1.1 constructed the response arguments incorrectly and could pass a stray newline.
