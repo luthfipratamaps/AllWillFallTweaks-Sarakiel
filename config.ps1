@@ -1,4 +1,5 @@
-﻿$GameDir = 'C:\Games\All Will Fall'
-$PluginsDir = Join-Path $GameDir 'BepInEx\plugins'
+﻿# Edit GameDir if All Will Fall is installed elsewhere.
+$GameDir = 'C:\Games\All Will Fall'
 $ModName = 'AllWillFallTweaks'
-$ModVersion = '0.6.5.1'
+$ModVersion = '0.7.2'
+$PluginsDir = Join-Path $GameDir 'BepInEx\plugins'

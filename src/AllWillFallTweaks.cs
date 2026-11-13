@@ -12,7 +12,7 @@ using UnityEngine.SceneManagement;
 
 namespace Sarakiel.AllWillFall
 {
-    [BepInPlugin("id.sarakiel.allwillfall.resourcetweaks", "All Will Fall - Resource Tweaks", "0.6.5.1")]
+    [BepInPlugin("id.sarakiel.allwillfall.resourcetweaks", "All Will Fall - Resource Tweaks", "0.7.2")]
     public class ResourceTweaks : BaseUnityPlugin
     {
         private readonly string[] names = { "Water", "Food", "Junk", "Wood", "Metal", "Sand", "Fuel", "Goods", "Tools" };
@@ -29,6 +29,19 @@ namespace Sarakiel.AllWillFall
         private ConfigEntry<bool> enableWater, enableFood, enableFuel, enableWarehouse, enableHouse;
         private bool capacityTab;
         private bool constructionTab;
+        private bool researchTab;
+        private ConfigEntry<bool> instantResearchRequested, freeResearchRequested;
+        private Type researchManagerType;
+        private MethodInfo forceCompleteResearchMethod;
+        private int researchHooksPatched;
+        private float nextResearchCheckAt;
+        private bool researchAuditWritten;
+        private float nextResearchWarningAt;
+        private object researchManager;
+        private MethodInfo getCurrentResearchMethod;
+        private float nextResearchDiscoveryAt;
+        private object lastCompletedResearch;
+        private float lastResearchCompletionAt;
         private ConfigEntry<bool> instantConstructionRequested, freeConstructionRequested;
         private bool constructionScanned;
         private int constructionMethodCount;
@@ -118,7 +131,7 @@ namespace Sarakiel.AllWillFall
             autoScanEnabled = Config.Bind("Startup", "AutoScanOnCityLoad", true, "Automatically discover buildings/resources after loading a city. Manual Rescan is still available.");
             autoScanInterval = Config.Bind("Startup", "BackgroundScanIntervalSeconds", 5f, "Interval for discovering newly constructed storages (minimum 1 second).");
             verboseDiagnostics = Config.Bind("Diagnostics", "VerboseLogging", false, "Log resource reflection details, per-storage traces and scan attempts for troubleshooting.");
-            performanceDiagnostics = Config.Bind("Diagnostics", "PerformanceDiagnostics", true,
+            performanceDiagnostics = Config.Bind("Diagnostics", "PerformanceDiagnostics", false,
                 "Periodically report frame hitches and worst scan timings (no per-frame logging).");
             slowOperationThresholdMs = Config.Bind("Diagnostics", "SlowOperationThresholdMs", 8f,
                 "Log a scan/synchronization immediately if it exceeds this many milliseconds.");
@@ -130,6 +143,10 @@ namespace Sarakiel.AllWillFall
                 "Instantly complete new building construction. Changes in the F8 menu are saved to this config.");
             freeConstructionRequested = Config.Bind("Construction", "FreeConstruction", true,
                 "Disable construction material requirements. Changes in the F8 menu are saved to this config.");
+            instantResearchRequested = Config.Bind("Research", "InstantResearch", true,
+                "Complete active research using the game's own ForceCompleteResearch(Research) API.");
+            freeResearchRequested = Config.Bind("Research", "FreeResearch", true,
+                "Suppress research material payments without affecting construction or production costs.");
             amountText = Math.Max(1, Math.Min(1000000, defaultAmount.Value)).ToString();
             window.x = Mathf.Clamp(savedX.Value, 0, Mathf.Max(0, Screen.width - window.width));
             window.y = Mathf.Clamp(savedY.Value, 0, Mathf.Max(0, Screen.height - window.height));
@@ -160,6 +177,7 @@ namespace Sarakiel.AllWillFall
             InstallCapacityPatches();
             InstallConstructionOverrides();
             InstallConstructionDirectPatches();
+            InstallResearchHooks();
             // City data is unavailable during Awake; defer scene scan to AutoScanCity.
             nextAutoScanAt = Time.unscaledTime + 1f;
         }
@@ -282,6 +300,7 @@ namespace Sarakiel.AllWillFall
         private void Update()
         {
             ProcessQueuedConstruction();
+            ResearchPeriodicCheck();
             if (autoScanEnabled != null && autoScanEnabled.Value) AutoScanCity();
             // Five primitive comparisons; no Unity scene scan or allocations.
             DetectCapacitySettingsChange();
@@ -311,6 +330,11 @@ namespace Sarakiel.AllWillFall
             {
                 observedSceneHandle = sceneHandle;
                 queuedConstruction.Clear();
+                researchAuditWritten = false;
+                researchManager = null;
+                lastCompletedResearch = null;
+                nextResearchDiscoveryAt = 0f;
+                nextResearchCheckAt = Time.unscaledTime + 1.5f;
                 manager = null;
                 inspected = false;
                 diagnosticsWritten = false;
@@ -324,13 +348,14 @@ namespace Sarakiel.AllWillFall
                 appliedCapacityLog.Clear();
                 autoScanAttempts = 0;
                 nextAutoScanAt = Time.unscaledTime + 1f;
+                lastFullStorageScan = -100f;
                 Logger.LogInfo("AUTO SCAN: scene changed; scheduling city discovery");
             }
             if (Time.unscaledTime < nextAutoScanAt) return;
             float interval = Mathf.Max(1f, autoScanInterval.Value);
             // Retry quickly while the city is initializing, then stay on a low-frequency
             // scan so new structures are picked up without opening the UI.
-            nextAutoScanAt = Time.unscaledTime + (lastManagerReady && storageKinds.Count > 0 ? interval : 1.5f);
+            nextAutoScanAt = Time.unscaledTime + (lastManagerReady ? interval : 1.5f);
             try
             {
                 // A non-null reference can point to a destroyed Unity component.
@@ -345,7 +370,7 @@ namespace Sarakiel.AllWillFall
                 }
                 lastManagerReady = ready;
                 Stopwatch scanWatch = Stopwatch.StartNew();
-                ScanStorageInstances(true);
+                ScanStorageInstances(false);
                 scanWatch.Stop();
                 RecordPerformance("Storage discovery", scanWatch.Elapsed.TotalMilliseconds, ref scannedStorageRuns, ref maxStorageScanMs);
                 Stopwatch syncWatch = Stopwatch.StartNew();
@@ -354,7 +379,7 @@ namespace Sarakiel.AllWillFall
                 RecordPerformance("Capacity synchronization", syncWatch.Elapsed.TotalMilliseconds, ref syncedCapacityRuns, ref maxCapacitySyncMs);
                 // Resource count discovery is expensive; the counts aren't visible
                 // while F8 is closed. Refresh only when the Resources tab is shown.
-                if (ready && visible && !capacityTab && !constructionTab)
+                if (ready && visible && !capacityTab && !constructionTab && !researchTab)
                 {
                     Stopwatch resourceWatch = Stopwatch.StartNew();
                     RefreshCounts();
@@ -511,14 +536,16 @@ namespace Sarakiel.AllWillFall
         {
             GUI.DrawTexture(new Rect(0, 0, 564, 4), primaryTex);
             GUI.Label(new Rect(19, 14, 400, 29), "ALL WILL FALL  /  TWEAKS", headingStyle);
-            GUI.Label(new Rect(22, 42, 450, 17), "SARAKIEL  •  TWEAKS DASHBOARD   v0.6.5.1", subtitleStyle);
+            GUI.Label(new Rect(22, 42, 450, 17), "SARAKIEL  •  TWEAKS DASHBOARD   v0.7.2", subtitleStyle);
             if (GUI.Button(new Rect(516, 18, 30, 28), "×", closeStyle)) { visible = false; pointerCaptured = false; SaveWindowPosition(); }
             GUI.DrawTexture(new Rect(18, 69, 528, 1), borderTex);
-            if (GUI.Button(new Rect(18, 77, 171, 30), "RESOURCES", !capacityTab && !constructionTab ? primaryStyle : buttonStyle)) { capacityTab = false; constructionTab = false; }
-            if (GUI.Button(new Rect(196, 77, 171, 30), "CAPACITY", capacityTab ? primaryStyle : buttonStyle)) { capacityTab = true; constructionTab = false; }
-            if (GUI.Button(new Rect(374, 77, 172, 30), "CONSTRUCTION", constructionTab ? primaryStyle : buttonStyle)) { constructionTab = true; capacityTab = false; }
+            if (GUI.Button(new Rect(18, 77, 127, 30), "RESOURCES", !capacityTab && !constructionTab && !researchTab ? primaryStyle : buttonStyle)) { capacityTab = false; constructionTab = false; researchTab = false; }
+            if (GUI.Button(new Rect(151, 77, 127, 30), "CAPACITY", capacityTab ? primaryStyle : buttonStyle)) { capacityTab = true; constructionTab = false; researchTab = false; }
+            if (GUI.Button(new Rect(284, 77, 128, 30), "CONSTRUCTION", constructionTab ? primaryStyle : buttonStyle)) { constructionTab = true; capacityTab = false; researchTab = false; }
+            if (GUI.Button(new Rect(418, 77, 128, 30), "RESEARCH", researchTab ? primaryStyle : buttonStyle)) { researchTab = true; capacityTab = false; constructionTab = false; }
             if (capacityTab) { DrawCapacityTab(); GUI.DragWindow(new Rect(0, 5, 500, 65)); return; }
             if (constructionTab) { DrawConstructionTab(); GUI.DragWindow(new Rect(0, 5, 500, 65)); return; }
+            if (researchTab) { DrawResearchTab(); GUI.DragWindow(new Rect(0, 5, 500, 65)); return; }
 
             GUI.Label(new Rect(19, 118, 85, 24), "ADD AMOUNT", mutedStyle);
             amountText = GUI.TextField(new Rect(113, 117, 133, 31), amountText, 8, inputStyle);
@@ -646,8 +673,9 @@ namespace Sarakiel.AllWillFall
         private readonly Dictionary<object, string> storageKinds = new Dictionary<object, string>(ReferenceEqualityComparer.Instance);
         private readonly Dictionary<object, int> storageBaseCapacities = new Dictionary<object, int>(ReferenceEqualityComparer.Instance);
         private readonly HashSet<object> unknownStorageLogged = new HashSet<object>(ReferenceEqualityComparer.Instance);
-        private float lastStorageScan;
+        private float lastFullStorageScan = -100f;
         private bool capacityScanBusy;
+        private const float FullStorageRescanSeconds = 30f;
         private sealed class ReferenceEqualityComparer : IEqualityComparer<object>
         {
             public static readonly ReferenceEqualityComparer Instance = new ReferenceEqualityComparer();
@@ -657,13 +685,24 @@ namespace Sarakiel.AllWillFall
         private void ScanStorageInstances(bool force)
         {
             if (capacityScanBusy) return;
-            if (!force && Time.unscaledTime - lastStorageScan < 0.6f) return;
-            lastStorageScan = Time.unscaledTime;
             capacityScanBusy = true;
             try
             {
-                // ResourceBuilding is a Unity component. Scan live objects, not only the
-                // CityResourceManager registry (which may omit some buildings).
+                if (manager == null) LocateManager();
+                if (manager == null) return; // No city: don't scan every loaded Unity object.
+
+                // Cheap path: use the already-maintained CityResourceManager registry
+                // on every scheduled check. This catches registered new warehouses.
+                FieldInfo f = manager.GetType().GetField("resourceBuildings", Flags);
+                IDictionary map = f == null ? null : f.GetValue(manager) as IDictionary;
+                if (map != null)
+                    foreach (DictionaryEntry item in map) RegisterStorage(item.Value, item.Key);
+
+                // Expensive fallback: discover ResourceBuilding components missing from
+                // the registry (unbuilt / newly spawned objects). Run only once per
+                // scene, on explicit Rescan, or every 30 s, never every 5 s.
+                if (!force && Time.unscaledTime - lastFullStorageScan < FullStorageRescanSeconds) return;
+                lastFullStorageScan = Time.unscaledTime;
                 Type rbType = AccessTools.TypeByName("ResourceBuilding");
                 if (rbType != null && typeof(UnityEngine.Object).IsAssignableFrom(rbType))
                 {
@@ -674,13 +713,6 @@ namespace Sarakiel.AllWillFall
                         if (component != null && !component.gameObject.scene.IsValid()) continue;
                         RegisterStorage(rb, null);
                     }
-                }
-                if (manager == null) LocateManager();
-                if (manager != null)
-                {
-                    FieldInfo f = manager.GetType().GetField("resourceBuildings", Flags);
-                    IDictionary map = f == null ? null : f.GetValue(manager) as IDictionary;
-                    if (map != null) foreach (DictionaryEntry item in map) RegisterStorage(item.Value, item.Key);
                 }
             }
             catch (Exception ex)
@@ -1271,6 +1303,161 @@ namespace Sarakiel.AllWillFall
                 }
                 catch (Exception ex) { Logger.LogError("CONSTRUCTION FORCE FAILED: " + ex); }
             }
+        }
+
+
+        // v0.7.1: patch only CityResearch, never global resource consumption.
+        // Runtime reflection avoids adding new compile-time dependencies to Research types.
+        private void InstallResearchHooks()
+        {
+            researchManagerType = AccessTools.TypeByName("CityResearch");
+            if (researchManagerType == null) { Logger.LogWarning("RESEARCH: CityResearch type not found"); return; }
+            Type researchType = AccessTools.TypeByName("Research");
+            if (researchType == null) { Logger.LogWarning("RESEARCH: Research type not found"); return; }
+            if (harmony == null) harmony = new Harmony("id.sarakiel.allwillfall.resourcetweaks.ui");
+            getCurrentResearchMethod = AccessTools.Method(researchManagerType, "GetCurrentOnGoingResearch", Type.EmptyTypes);
+            forceCompleteResearchMethod = AccessTools.Method(researchManagerType, "ForceCompleteResearch", new [] { researchType });
+            if (getCurrentResearchMethod == null || forceCompleteResearchMethod == null)
+                Logger.LogWarning("RESEARCH: native current/force-complete API missing or incompatible; Instant Research disabled");
+            else Logger.LogInfo("RESEARCH: native active research completion API ready");
+            ResearchPatch("PayForResearch", new [] { researchType, typeof(ResourceBlock) }, "ResearchPaymentPrefix", true);
+            ResearchPatch("GetResourcesToPayForTicks", null, "ResearchTickCostPostfix", false);
+            ResearchPatch("LackingResourcesToFinish", Type.EmptyTypes, "ResearchLackingResourcesPostfix", false);
+            Type researchBuildingType = AccessTools.TypeByName("ResearchBuilding");
+            if (researchBuildingType != null)
+                ResearchPatchOnType(researchBuildingType, "ResourcesNeededToFinishResearch", Type.EmptyTypes, "ResearchTickCostPostfix", false);
+            Logger.LogInfo("RESEARCH: " + researchHooksPatched + "/4 research-only material hooks installed");
+        }
+
+        private void ResearchPatch(string name, Type[] signature, string callback, bool prefix)
+        {
+            ResearchPatchOnType(researchManagerType, name, signature, callback, prefix);
+        }
+
+        private void ResearchPatchOnType(Type owner, string name, Type[] signature, string callback, bool prefix)
+        {
+            try
+            {
+                MethodInfo target = signature == null
+                    ? owner.GetMethods(Flags).FirstOrDefault(m => m.Name == name && m.GetParameters().Length == 2)
+                    : AccessTools.Method(owner, name, signature);
+                MethodInfo patch = typeof(ResourceTweaks).GetMethod(callback, BindingFlags.NonPublic | BindingFlags.Static);
+                if (target == null || patch == null) { Logger.LogWarning("RESEARCH PATCH: unavailable " + owner.Name + "." + name); return; }
+                if (prefix) harmony.Patch(target, prefix: new HarmonyMethod(patch));
+                else harmony.Patch(target, postfix: new HarmonyMethod(patch));
+                researchHooksPatched++;
+                Logger.LogInfo("RESEARCH PATCH: " + owner.Name + "." + name);
+            }
+            catch (Exception ex) { Logger.LogWarning("RESEARCH PATCH FAILED: " + owner.Name + "." + name + ": " + ex.Message); }
+        }
+
+        private static bool WantsFreeResearch()
+        {
+            return active != null && active.freeResearchRequested != null && active.freeResearchRequested.Value;
+        }
+        private static void ResearchPaymentPrefix(ref ResourceBlock __1)
+        {
+            if (WantsFreeResearch()) __1 = new ResourceBlock();
+        }
+        private static void ResearchTickCostPostfix(ref ResourceBlock __result)
+        {
+            if (WantsFreeResearch()) __result = new ResourceBlock();
+        }
+        private static void ResearchLackingResourcesPostfix(ref bool __result)
+        {
+            if (WantsFreeResearch()) __result = false;
+        }
+
+        private void ScanResearchAPI()
+        {
+            if (researchAuditWritten) return;
+            researchAuditWritten = true;
+            try
+            {
+                var asm = AppDomain.CurrentDomain.GetAssemblies().FirstOrDefault(a => a.GetName().Name == "ScriptsAssembly");
+                if (asm == null) { Logger.LogWarning("RESEARCH API: ScriptsAssembly missing"); return; }
+                foreach (string typeName in new [] { "CityResearch", "ResearchBuilding", "CityTechnology", "Technology", "ResearchProgress" })
+                {
+                    Type t = SafeTypes(asm).FirstOrDefault(x => x != null && x.Name == typeName);
+                    if (t == null) { Logger.LogInfo("RESEARCH TYPE: " + typeName + " not present"); continue; }
+                    Logger.LogInfo("RESEARCH TYPE: " + t.FullName + " base=" + (t.BaseType != null ? t.BaseType.Name : "none"));
+                    foreach (FieldInfo f in t.GetFields(Flags))
+                        if (!f.IsStatic) Logger.LogInfo("RESEARCH FIELD: " + t.Name + "." + f.Name + " : " + f.FieldType);
+                    foreach (MethodInfo m in t.GetMethods(Flags).Where(m => m.DeclaringType == t &&
+                        (t.Name == "CityResearch" || m.Name.IndexOf("Research", StringComparison.OrdinalIgnoreCase) >= 0 || m.Name.IndexOf("Progress", StringComparison.OrdinalIgnoreCase) >= 0)))
+                        Logger.LogInfo("RESEARCH METHOD: " + t.Name + "." + m);
+                }
+                Logger.LogInfo("RESEARCH API SCAN COMPLETE; no research resources or progress modified");
+            }
+            catch (Exception ex) { Logger.LogWarning("RESEARCH API SCAN FAILED: " + ex.Message); researchAuditWritten = false; }
+        }
+
+        private void ResearchPeriodicCheck()
+        {
+            if (instantResearchRequested == null || !instantResearchRequested.Value) return;
+            if (Time.unscaledTime < nextResearchCheckAt) return;
+            nextResearchCheckAt = Time.unscaledTime + 0.5f;
+            if (researchManagerType == null || getCurrentResearchMethod == null || forceCompleteResearchMethod == null) return;
+            try
+            {
+                UnityEngine.Object unityResearch = researchManager as UnityEngine.Object;
+                if (unityResearch != null && !unityResearch) researchManager = null;
+                if (researchManager == null)
+                {
+                    if (Time.unscaledTime < nextResearchDiscoveryAt) return;
+                    nextResearchDiscoveryAt = Time.unscaledTime + 5f;
+                    researchManager = UnityEngine.Object.FindObjectOfType(researchManagerType);
+                    if (researchManager == null) return;
+                }
+                object current = getCurrentResearchMethod.Invoke(researchManager, null);
+                if (current == null) { lastCompletedResearch = null; return; }
+                // A cooldown prevents repeated completion if the game leaves the same
+                // research as 'current' for one or more simulation ticks.
+                if (object.ReferenceEquals(current, lastCompletedResearch) && Time.unscaledTime - lastResearchCompletionAt < 4f) return;
+                lastCompletedResearch = current;
+                lastResearchCompletionAt = Time.unscaledTime;
+                forceCompleteResearchMethod.Invoke(researchManager, new [] { current });
+                Logger.LogInfo("RESEARCH COMPLETE: native ForceCompleteResearch executed for active technology");
+            }
+            catch (Exception ex)
+            {
+                if (Time.unscaledTime >= nextResearchWarningAt)
+                {
+                    nextResearchWarningAt = Time.unscaledTime + 30f;
+                    Logger.LogWarning("RESEARCH COMPLETION FAILED: " + ex.GetBaseException().Message);
+                }
+            }
+        }
+
+        private void DrawResearchTab()
+        {
+            GUI.Label(new Rect(19, 121, 520, 29), "RESEARCH TWEAKS  /  GAME OVERRIDES", headingStyle);
+            GUI.Label(new Rect(19, 155, 520, 53),
+                "Independent research settings, saved to BepInEx config.\n" +
+                "Native completion + research-only material cost override.", bodyStyle);
+            GUI.Label(new Rect(23, 213, 365, 34), "Instant Research", bodyStyle);
+            bool instant = instantResearchRequested.Value;
+            if (GUI.Button(new Rect(413, 211, 128, 34), instant ? "ON  [X]" : "OFF", instant ? primaryStyle : buttonStyle)) instant = !instant;
+            GUI.Label(new Rect(23, 260, 365, 34), "Free Research / No Material Cost", bodyStyle);
+            bool free = freeResearchRequested.Value;
+            if (GUI.Button(new Rect(413, 258, 128, 34), free ? "ON  [X]" : "OFF", free ? primaryStyle : buttonStyle)) free = !free;
+            if (instant != instantResearchRequested.Value || free != freeResearchRequested.Value)
+            {
+                instantResearchRequested.Value = instant;
+                freeResearchRequested.Value = free;
+                try { Config.Save(); Logger.LogInfo("RESEARCH SETTINGS SAVED: instant=" + instant + " free=" + free); }
+                catch (Exception ex) { Logger.LogWarning("RESEARCH CONFIG SAVE FAILED: " + ex.Message); }
+            }
+            if (GUI.Button(new Rect(19, 322, 526, 39), "SCAN RESEARCH API  /  WRITE LOG", primaryStyle))
+            {
+                researchAuditWritten = false;
+                ScanResearchAPI();
+            }
+            GUI.DrawTexture(new Rect(18, 387, 528, 1), borderTex);
+            GUI.Label(new Rect(19, 399, 526, 81),
+                "RESEARCH v0.7.2  —  direct research hooks.\n" +
+                "Independent ON/OFF settings are saved automatically.\n" +
+                "Test on a backup save; report any incomplete unlocks.", mutedStyle);
         }
 
         private void DrawConstructionTab()
