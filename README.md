@@ -1,17 +1,27 @@
-# All Will Fall Tweaks v0.4.5 (experimental)
+# All Will Fall Tweaks — Sarakiel v0.5.0
 
-BepInEx 5 Mono plugin. Same working resource controls, housing 5x, and click-through guard as prior versions.
+BepInEx 5 (Mono) mod. Stable-feature cleanup release based on v0.4.6, with no changes to the verified resource, housing, storage-capacity or input-guard algorithms.
 
-## Install
-Game: `C:\Games\All Will Fall`
-Plugin folder: `C:\Games\All Will Fall\BepInEx\plugins`
-Double-click `install.cmd`. `build.cmd` builds; `release.cmd` packages; `uninstall.cmd` removes plugin. Requires installed game and BepInEx on Windows.
+## Install and build
 
-## Storage fix being tested
-The game can read `Storage.Capacity` before a building-to-storage mapping is available. This update scans owners periodically, caches original backing capacity, and sets the live `Storage.capacity` field to original * multiplier. This may also correct the slider which appears to use the backing capacity. Food Storage variants also map to food.
+- Game: `C:\Games\All Will Fall`
+- Plugins: `C:\Games\All Will Fall\BepInEx\plugins`
+- Double-click `install.cmd` to build and install (requires the same Windows compiler and game files as v0.4.6).
+- `build.cmd` builds only; `release.cmd` creates a distributable ZIP; `uninstall.cmd` removes the mod DLL.
+- Press **F8** for the dashboard; the city and newly constructed buildings are scanned automatically.
 
-For water (300), food warehouse (600), fuel warehouse (1000), and general warehouse (600), default is 10x; for houses (8), 5x. Live config changes supported.
+## Default settings
 
-**Back up your save** before testing: modified backing fields could be serialized by the game. After updating, check water/food/fuel/general displayed capacities, slider fill, physical stock beyond normal limits, then housing and input guard.
+The plugin *generates* its config under `BepInEx\config\id.sarakiel.allwillfall.resourcetweaks.cfg` using `Config.Bind` defaults on first launch. A short reference copy is provided at `defaults/default-settings.cfg.example`.
 
-Look for `CAPACITY OWNER` and `CAPACITY APPLY` in BepInEx/LogOutput.log. This build has NOT been compiled in the user's Windows environment or runtime-verified.
+- Storage multiplier 10x, house multiplier 5x.
+- Water, food, fuel, general warehouse, and housing enabled.
+- Auto scan enabled, repeat interval 5 seconds.
+- Both mouse input guards enabled. F8 menu; resource amount 100; window X=110, Y=90.
+- Verbose diagnostics disabled by default.
+
+**Existing configs are retained**: BepInEx does not overwrite your saved preferences when a plugin version changes. To regenerate *all* factory defaults, first back up or rename the existing `.cfg` while the game is closed, then launch the game.
+
+## Notes
+
+Capacity adjustments can affect saves; test on a backup city. Changes to an in-use storage may be saved as in-game values. The game must be installed locally for compilation. This package hasn't been tested on your Windows system.

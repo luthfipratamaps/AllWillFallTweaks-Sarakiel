@@ -7,15 +7,16 @@ using BepInEx;
 using BepInEx.Configuration;
 using HarmonyLib;
 using UnityEngine;
+using UnityEngine.SceneManagement;
 
 namespace Sarakiel.AllWillFall
 {
-    [BepInPlugin("id.sarakiel.allwillfall.resourcetweaks", "All Will Fall - Resource Tweaks", "0.4.5")]
+    [BepInPlugin("id.sarakiel.allwillfall.resourcetweaks", "All Will Fall - Resource Tweaks", "0.5.0")]
     public class ResourceTweaks : BaseUnityPlugin
     {
         private readonly string[] names = { "Water", "Food", "Junk", "Wood", "Metal", "Sand", "Fuel", "Goods", "Tools" };
         private bool visible;
-        private string amountText = "1000";
+        private string amountText = "100";
         private string status = "Press F8 to open";
         private Rect window = new Rect(110, 90, 564, 505);
         private ConfigEntry<float> savedX, savedY;
@@ -26,6 +27,14 @@ namespace Sarakiel.AllWillFall
         private ConfigEntry<int> storageMultiplier, housingMultiplier;
         private ConfigEntry<bool> enableWater, enableFood, enableFuel, enableWarehouse, enableHouse;
         private bool capacityTab;
+        private ConfigEntry<bool> autoScanEnabled;
+        private ConfigEntry<float> autoScanInterval;
+        private ConfigEntry<bool> verboseDiagnostics;
+        private int observedSceneHandle = int.MinValue;
+        private float nextAutoScanAt;
+        private int autoScanAttempts;
+        private bool lastManagerReady;
+
         private readonly List<string> capacityDiagnostics = new List<string>();
         private int capacityPatched;
         private int inputMethodsPatched;
@@ -50,7 +59,7 @@ namespace Sarakiel.AllWillFall
             savedX = Config.Bind("UI", "WindowX", 110f, "Last window X position");
             savedY = Config.Bind("UI", "WindowY", 90f, "Last window Y position");
             toggleKey = Config.Bind("UI", "ToggleKey", KeyCode.F8, "Toggle the resource menu");
-            defaultAmount = Config.Bind("Resources", "DefaultAmount", 1000, "Starting amount for a new session");
+            defaultAmount = Config.Bind("Resources", "DefaultAmount", 100, "Starting amount for a new session");
             strictMouseBlock = Config.Bind("Input", "BlockWorldMouseWhileMenuOpen", true, "Experimental: suppress legacy Unity mouse button polling whenever the tweak window is open. Turn off if incompatible.");
             newInputSystemBlock = Config.Bind("Input", "BlockNewInputSystemWhileMenuOpen", true, "Suppress newer Unity Input System mouse buttons and actions while the tweak menu is open. Disable if incompatible.");
             storageMultiplier = Config.Bind("Capacity", "StorageMultiplier", 10, "Storage building capacity multiplier (1-100). Calculated from the original getter capacity, not saved to assets.");
@@ -60,6 +69,9 @@ namespace Sarakiel.AllWillFall
             enableFuel = Config.Bind("Capacity", "FuelWarehouse", true, "Enable fuel warehouse multiplier");
             enableWarehouse = Config.Bind("Capacity", "GeneralWarehouse", true, "Enable general warehouse multiplier");
             enableHouse = Config.Bind("Capacity", "Housing", true, "Enable house occupancy multiplier");
+            autoScanEnabled = Config.Bind("Startup", "AutoScanOnCityLoad", true, "Automatically discover buildings/resources after loading a city. Manual Rescan is still available.");
+            autoScanInterval = Config.Bind("Startup", "BackgroundScanIntervalSeconds", 5f, "Interval for discovering newly constructed storages (minimum 1 second).");
+            verboseDiagnostics = Config.Bind("Diagnostics", "VerboseLogging", false, "Log resource reflection details, per-storage traces and scan attempts for troubleshooting.");
             amountText = Math.Max(1, Math.Min(1000000, defaultAmount.Value)).ToString();
             window.x = Mathf.Clamp(savedX.Value, 0, Mathf.Max(0, Screen.width - window.width));
             window.y = Mathf.Clamp(savedY.Value, 0, Mathf.Max(0, Screen.height - window.height));
@@ -89,6 +101,7 @@ namespace Sarakiel.AllWillFall
             InstallNewInputGuard();
             InstallCapacityPatches();
             ScanStorageInstances(true);
+            nextAutoScanAt = Time.unscaledTime + 1f;
         }
 
         // IMGUI uses Event.current, while many games poll UnityEngine.Input separately.
@@ -208,6 +221,7 @@ namespace Sarakiel.AllWillFall
 
         private void Update()
         {
+            if (autoScanEnabled != null && autoScanEnabled.Value) AutoScanCity();
             if (capacityPatched > 0)
             {
                 ScanStorageInstances(false);
@@ -217,6 +231,61 @@ namespace Sarakiel.AllWillFall
             {
                 visible = !visible;
                 if (!visible) { pointerCaptured = false; SaveWindowPosition(); }
+            }
+        }
+
+        // City objects are often not ready during Awake(). Detect new scene sessions,
+        // retry during loading, and keep a slow background scan for new construction.
+        // Never clear the base-capacity cache on routine scans: values are already
+        // multiplied in the live Storage.capacity field.
+        private void AutoScanCity()
+        {
+            int sceneHandle = SceneManager.GetActiveScene().handle;
+            if (sceneHandle != observedSceneHandle)
+            {
+                observedSceneHandle = sceneHandle;
+                manager = null;
+                inspected = false;
+                diagnosticsWritten = false;
+                lastManagerReady = false;
+                counts.Clear();
+                storageKinds.Clear();
+                storageBaseCapacities.Clear();
+                unknownStorageLogged.Clear();
+                tracedStorage.Clear();
+                appliedCapacityLog.Clear();
+                autoScanAttempts = 0;
+                nextAutoScanAt = Time.unscaledTime + 1f;
+                Logger.LogInfo("AUTO SCAN: scene changed; scheduling city discovery");
+            }
+            if (Time.unscaledTime < nextAutoScanAt) return;
+            float interval = Mathf.Max(1f, autoScanInterval.Value);
+            // Retry quickly while the city is initializing, then stay on a low-frequency
+            // scan so new structures are picked up without opening the UI.
+            nextAutoScanAt = Time.unscaledTime + (lastManagerReady && storageKinds.Count > 0 ? interval : 1.5f);
+            try
+            {
+                // A non-null reference can point to a destroyed Unity component.
+                var unityManager = manager as UnityEngine.Object;
+                if (unityManager != null && !unityManager) manager = null;
+                if (manager == null) LocateManager();
+                bool ready = manager != null;
+                if (ready && !lastManagerReady)
+                {
+                    Logger.LogInfo("AUTO SCAN: CityResourceManager ready");
+                    lastCountRefresh = -100f;
+                }
+                lastManagerReady = ready;
+                ScanStorageInstances(true);
+                ApplyStorageCapacities();
+                if (ready) RefreshCounts();
+                autoScanAttempts++;
+                if (verboseDiagnostics.Value && (autoScanAttempts <= 3 || autoScanAttempts == 10))
+                    Logger.LogInfo("AUTO SCAN: attempt=" + autoScanAttempts + " city=" + ready + " tracked=" + storageKinds.Count);
+            }
+            catch (Exception ex)
+            {
+                if (autoScanAttempts++ < 3) Logger.LogWarning("AUTO SCAN: retrying after " + ex.Message);
             }
         }
 
@@ -321,7 +390,7 @@ namespace Sarakiel.AllWillFall
         {
             GUI.DrawTexture(new Rect(0, 0, 564, 4), primaryTex);
             GUI.Label(new Rect(19, 14, 400, 29), "ALL WILL FALL  /  TWEAKS", headingStyle);
-            GUI.Label(new Rect(22, 42, 450, 17), "SARAKIEL  •  TWEAKS DASHBOARD   v0.4.5", subtitleStyle);
+            GUI.Label(new Rect(22, 42, 450, 17), "SARAKIEL  •  TWEAKS DASHBOARD   v0.5.0", subtitleStyle);
             if (GUI.Button(new Rect(516, 18, 30, 28), "×", closeStyle)) { visible = false; pointerCaptured = false; SaveWindowPosition(); }
             GUI.DrawTexture(new Rect(18, 69, 528, 1), borderTex);
             if (GUI.Button(new Rect(18, 77, 259, 30), "RESOURCES", capacityTab ? buttonStyle : primaryStyle)) capacityTab = false;
@@ -357,7 +426,7 @@ namespace Sarakiel.AllWillFall
                 RefreshCounts();
             }
             if (GUI.Button(new Rect(394, 395, 152, 38), "⟳  RESCAN", buttonStyle))
-            { inspected = false; manager = null; counts.Clear(); LocateManager(); RefreshCounts(); }
+            { inspected = false; manager = null; counts.Clear(); LocateManager(); ScanStorageInstances(true); ApplyStorageCapacities(); RefreshCounts(); }
             GUI.DrawTexture(new Rect(18, 445, 528, 1), borderTex);
             GUI.Label(new Rect(19, 451, 524, 32), status, mutedStyle);
             GUI.DragWindow(new Rect(0, 5, 500, 65));
@@ -407,7 +476,7 @@ namespace Sarakiel.AllWillFall
                 kind == "food" ? active.enableFood.Value :
                 kind == "fuel" ? active.enableFuel.Value :
                 kind == "warehouse" ? active.enableWarehouse.Value : false;
-            if (active.tracedStorage.Add(__instance) && active.tracedStorage.Count <= 48)
+            if (active.verboseDiagnostics.Value && active.tracedStorage.Add(__instance) && active.tracedStorage.Count <= 48)
             {
                 int raw = -1;
                 try { var f = __instance.GetType().GetField("capacity", Flags); if (f != null) raw = (int)f.GetValue(__instance); } catch { }
@@ -440,7 +509,7 @@ namespace Sarakiel.AllWillFall
             // Refresh only after a missed lookup. Harmony patches may execute often.
             ScanStorageInstances(false);
             if (storageKinds.TryGetValue(targetStorage, out kind)) return kind;
-            if (unknownStorageLogged.Add(targetStorage) && unknownStorageLogged.Count <= 12)
+            if (verboseDiagnostics.Value && unknownStorageLogged.Add(targetStorage) && unknownStorageLogged.Count <= 12)
             {
                 Logger.LogWarning("CAPACITY UNKNOWN STORAGE: " + targetStorage.GetType().FullName +
                     ". No building owner matched; original capacity kept.");
@@ -666,7 +735,7 @@ namespace Sarakiel.AllWillFall
                     }
                 }
                 if (manager == null) { status = "Load a city first, then Rescan"; return; }
-                if (!inspected)
+                if (!inspected && verboseDiagnostics.Value)
                 {
                     foreach (var method in managerType.GetMethods(Flags).Where(m => m.Name.IndexOf("Resource", StringComparison.OrdinalIgnoreCase) >= 0))
                         Logger.LogInfo("RESOURCE API: " + method);

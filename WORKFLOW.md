@@ -1,9 +1,9 @@
-# Development workflow
+# Workflow
 
-1. `build.cmd` — compile from `src` using installed game/BepInEx references.
-2. `install.cmd` — build and install to `C:\Games\All Will Fall\BepInEx\plugins`.
-3. Test on a backup save (F8).
-4. `release.cmd` — produce release archive.
-5. `uninstall.cmd` — remove installed plugin.
+1. Edit `src/AllWillFallTweaks.cs`.
+2. Double-click `build.cmd`, then `install.cmd` to deploy.
+3. Start the game: automatic city/storage scan runs after loading; F8 opens the menu.
+4. Double-click `release.cmd` to build a distributable ZIP.
+5. To debug, set `[Diagnostics] VerboseLogging = true` in the BepInEx config.
 
-Inspect `CAPACITY APPLY` / `CAPACITY OWNER` when diagnosing storage.
+Use `config.ps1` to change game paths. Do not overwrite existing user config files during install.

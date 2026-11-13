@@ -1,11 +1,13 @@
 # Changelog
 
-## 0.4.5 — Storage backing-capacity synchronization (experimental)
-- Carry forward working 0.4.4 resource injection, F8 dashboard, input guards and housing getter.
-- Scan live ResourceBuilding owners more frequently (0.6 s).
-- Cache base `Storage.capacity` on first discovery and apply effective capacity directly to the backing field for the four enabled warehouse families.
-- Keep the getter postfix for consistent simulation queries; derive from the saved original capacity.
-- Restore base field when storage multiplier is 1x or building type disabled, while game is running.
-- Log the first `CAPACITY APPLY` per storage for easier troubleshooting.
-- This changes live game state and can be serialized in saves. Test on backup saves.
-- UI slider correction is expected if its backing denominator is Storage.capacity; not verified.
+## v0.5.0 — Clean baseline & default configuration
+
+- Matched fresh-generated BepInEx configuration to the user-tested v0.4.6 settings.
+- Fresh-session default resource amount is now 100 (previously 1000).
+- Added optional `[Diagnostics] VerboseLogging`, default `false`; hides repeated reflection and per-storage tracing except when troubleshooting.
+- Preserved v0.4.6 capacity sync, auto-scan, resource injection, modern UI and Input System guard.
+- Retained existing configs on installation; added sample defaults and updated documentation.
+
+## v0.4.6
+
+- Auto scan after city load, retries and background discovery.
