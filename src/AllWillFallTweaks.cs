@@ -12,7 +12,7 @@ using UnityEngine.SceneManagement;
 
 namespace Sarakiel.AllWillFall
 {
-    [BepInPlugin("id.sarakiel.allwillfall.resourcetweaks", "All Will Fall - Resource Tweaks", "0.9.5")]
+    [BepInPlugin("id.sarakiel.allwillfall.resourcetweaks", "All Will Fall - Resource Tweaks", "0.10.1")]
     public class ResourceTweaks : BaseUnityPlugin
     {
         private readonly string[] names = { "Water", "Food", "Junk", "Wood", "Metal", "Sand", "Fuel", "Goods", "Tools" };
@@ -32,6 +32,21 @@ namespace Sarakiel.AllWillFall
         private bool researchTab;
         private bool productionTab;
         private bool citizenTab;
+        private bool weatherTab;
+        private bool weatherApiInspected;
+        private bool weatherApiPending = true;
+        private static MethodInfo weatherSeaDeltaMethod;
+        private object weatherSeaDeltaOwner;
+        private static bool weatherRainHookReady;
+        private static bool weatherStormHookReady;
+        private float pendingSeaFraction;
+        private float weatherSeaOffset;
+        private string weatherSeaStatus = "Sea control initializing";
+        private string weatherApiStatus = "Detecting weather controls...";
+        private ConfigEntry<float> weatherLevelStep;
+        private ConfigEntry<float> weatherRainIntensity;
+        private ConfigEntry<bool> weatherStormsDisabled;
+        private ConfigEntry<string> weatherPreset;
         private ConfigEntry<bool> citizenMaxHappiness, citizenNoHunger, citizenNoThirst, citizenSpeedEnabled;
         private ConfigEntry<int> citizenSpeedMultiplier;
         private ConfigEntry<bool> citizenWorkSpeedEnabled, citizenCarryEnabled;
@@ -144,6 +159,7 @@ namespace Sarakiel.AllWillFall
         private readonly Dictionary<string, string> counts = new Dictionary<string, string>();
         private static ResourceTweaks active;
         private const int WindowId = 98311;
+        private static readonly string[] tabLabels = { "ITEMS", "CAPACITY", "BUILD", "RESEARCH", "OUTPUT", "CITIZENS", "WEATHER" };
         private Type managerType;
         private object manager;
         private bool inspected;
@@ -213,6 +229,10 @@ namespace Sarakiel.AllWillFall
                 "Carry capacity multiplier (1, 2, 5, 10, 25, 50); result clamped to avoid integer overflow.");
             revealRecruitedGroups = Config.Bind("Citizens", "RevealRecruitedGroupsInHUD", true,
                 "Experimental: include recruited social groups in the city unlocked-group list and request HUD refresh. May also expose faction features; use a backup save.");
+            weatherLevelStep = Config.Bind("Weather", "SeaLevelStepMeters", 1f, "Sea-level adjustment step. Native game sea units are used; exact meter equivalence is unverified.");
+            weatherRainIntensity = Config.Bind("Weather", "RainIntensity", 1f, "Multiplies native WeatherSegment raininess (0, 1, 2).");
+            weatherStormsDisabled = Config.Bind("Weather", "DisableStorms", false, "Suppress wind and weather-related physics stress; does not rewrite forecasts.");
+            weatherPreset = Config.Bind("Weather", "Preset", "Default", "Override weather parameters using compatible WeatherSegment getters; does not rewrite forecast blocks.");
             amountText = Math.Max(1, Math.Min(1000000, defaultAmount.Value)).ToString();
             window.x = Mathf.Clamp(savedX.Value, 0, Mathf.Max(0, Screen.width - window.width));
             window.y = Mathf.Clamp(savedY.Value, 0, Mathf.Max(0, Screen.height - window.height));
@@ -246,6 +266,7 @@ namespace Sarakiel.AllWillFall
             InstallResearchHooks();
             InstallProductionHooks();
             InstallCitizenHooks();
+            InstallWeatherHooks();
             // City data is unavailable during Awake; defer scene scan to AutoScanCity.
             nextAutoScanAt = Time.unscaledTime + 1f;
         }
@@ -412,6 +433,13 @@ namespace Sarakiel.AllWillFall
                 inspected = false;
                 diagnosticsWritten = false;
                 lastManagerReady = false;
+                weatherApiInspected = false;
+                weatherApiPending = true;
+                weatherApiStatus = "Waiting for city...";
+                weatherSeaDeltaOwner = null;
+                weatherSeaStatus = "Sea control initializing";
+                pendingSeaFraction = 0f;
+                weatherSeaOffset = 0f;
                 capacitySettingsDirty = false;
                 counts.Clear();
                 storageKinds.Clear();
@@ -448,10 +476,11 @@ namespace Sarakiel.AllWillFall
                 bool initialCityScan = ready && !lastManagerReady;
                 lastManagerReady = ready;
                 if (ready) ScanStorageInstances(initialCityScan);
+                if (ready && !weatherApiInspected) InspectWeatherApiOnce();
                 ApplyStorageCapacities();
                 // Resource count discovery is expensive; the counts aren't visible
                 // while F8 is closed. Refresh only when the Resources tab is shown.
-                if (ready && visible && !capacityTab && !constructionTab && !researchTab && !productionTab && !citizenTab)
+                if (ready && visible && !capacityTab && !constructionTab && !researchTab && !productionTab && !citizenTab && !weatherTab)
                 {
                     RefreshCounts();
                 }
@@ -607,18 +636,17 @@ namespace Sarakiel.AllWillFall
         {
             GUI.DrawTexture(new Rect(0, 0, 564, 4), primaryTex);
             GUI.Label(new Rect(19, 14, 400, 29), "ALL WILL FALL  /  TWEAKS", headingStyle);
-            GUI.Label(new Rect(22, 42, 450, 17), "SARAKIEL  •  TWEAKS   v0.9.5", subtitleStyle);
+            GUI.Label(new Rect(22, 42, 450, 17), "SARAKIEL  •  TWEAKS   v0.10.0", subtitleStyle);
             if (GUI.Button(new Rect(516, 18, 30, 28), "×", closeStyle)) { visible = false; pointerCaptured = false; SaveWindowPosition(); }
             GUI.DrawTexture(new Rect(18, 69, 528, 1), borderTex);
-            // Six tabs sized to fit within 564px window, with no horizontal overflow.
-            string[] labels = { "RESOURCES", "CAPACITY", "BUILD", "RESEARCH", "OUTPUT", "CITIZENS" };
-            int selected = citizenTab ? 5 : productionTab ? 4 : researchTab ? 3 : constructionTab ? 2 : capacityTab ? 1 : 0;
-            for (int i = 0; i < labels.Length; i++)
+            // Seven tabs; fixed positions and no per-frame tab-label allocations.
+            int selected = weatherTab ? 6 : citizenTab ? 5 : productionTab ? 4 : researchTab ? 3 : constructionTab ? 2 : capacityTab ? 1 : 0;
+            for (int i = 0; i < tabLabels.Length; i++)
             {
-                if (GUI.Button(new Rect(18 + i * 89, 77, 83, 30), labels[i], selected == i ? primaryStyle : buttonStyle))
+                if (GUI.Button(new Rect(18 + i * 76, 77, 72, 30), tabLabels[i], selected == i ? primaryStyle : buttonStyle))
                 {
                     capacityTab = i == 1; constructionTab = i == 2; researchTab = i == 3;
-                    productionTab = i == 4; citizenTab = i == 5;
+                    productionTab = i == 4; citizenTab = i == 5; weatherTab = i == 6;
                 }
             }
             if (capacityTab) { DrawCapacityTab(); GUI.DragWindow(new Rect(0, 5, 500, 65)); return; }
@@ -626,6 +654,7 @@ namespace Sarakiel.AllWillFall
             if (researchTab) { DrawResearchTab(); GUI.DragWindow(new Rect(0, 5, 500, 65)); return; }
             if (productionTab) { DrawProductionTab(); GUI.DragWindow(new Rect(0, 5, 500, 65)); return; }
             if (citizenTab) { DrawCitizensTab(); GUI.DragWindow(new Rect(0, 5, 500, 65)); return; }
+            if (weatherTab) { DrawWeatherTab(); GUI.DragWindow(new Rect(0, 5, 500, 65)); return; }
 
             GUI.Label(new Rect(19, 118, 85, 24), "ADD AMOUNT", mutedStyle);
             amountText = GUI.TextField(new Rect(113, 117, 133, 31), amountText, 8, inputStyle);
@@ -907,6 +936,171 @@ namespace Sarakiel.AllWillFall
                 catch { }
             }
             return String.Join(" ", identifiers.ToArray());
+        }
+
+        // v0.10.1: weather getter hooks are O(1) and never scan scene objects.
+        // Sea-level native API lookup is performed once on city initialization.
+        private void InstallWeatherHooks()
+        {
+            try
+            {
+                if (harmony == null) harmony = new Harmony("id.sarakiel.allwillfall.resourcetweaks.ui");
+                Type segment = AccessTools.TypeByName("WeatherSegment");
+                if (segment == null) { Logger.LogWarning("WEATHER: WeatherSegment unavailable"); return; }
+                string[] getterNames = {"get_Raininess", "get_Cloudiness", "get_Wind", "get_ExtraPhysicsStress", "get_SeaFlow"};
+                MethodInfo patch = typeof(ResourceTweaks).GetMethod("WeatherNumberPostfix", BindingFlags.NonPublic | BindingFlags.Static);
+                foreach (string name in getterNames)
+                {
+                    MethodInfo getter = segment.GetMethod(name, Flags, null, Type.EmptyTypes, null);
+                    if (getter == null || getter.ReturnType != typeof(float)) continue;
+                    try
+                    {
+                        harmony.Patch(getter, postfix: new HarmonyMethod(patch));
+                        Logger.LogInfo("WEATHER PATCH: WeatherSegment." + name);
+                        if (name == "get_Raininess") weatherRainHookReady = true;
+                        if (name == "get_Wind" || name == "get_ExtraPhysicsStress") weatherStormHookReady = true;
+                    }
+                    catch (Exception ex) { Logger.LogWarning("WEATHER PATCH skipped " + name + ": " + ex.Message); }
+                }
+            }
+            catch (Exception ex) { Logger.LogWarning("WEATHER PATCH initialization: " + ex.Message); }
+        }
+
+        private static void WeatherNumberPostfix(MethodBase __originalMethod, ref float __result)
+        {
+            ResourceTweaks a = active;
+            if (a == null || a.weatherPreset == null) return;
+            string name = __originalMethod.Name;
+            string preset = a.weatherPreset.Value ?? "Default";
+            bool clear = String.Equals(preset, "Clear", StringComparison.OrdinalIgnoreCase);
+            bool rainy = String.Equals(preset, "Rain", StringComparison.OrdinalIgnoreCase);
+            bool storm = String.Equals(preset, "Storm", StringComparison.OrdinalIgnoreCase);
+            bool suppress = a.weatherStormsDisabled != null && a.weatherStormsDisabled.Value;
+            if (name == "get_Raininess")
+            {
+                if (clear || (suppress && storm)) __result = 0f;
+                else
+                {
+                    float val = __result;
+                    if (rainy) val = Mathf.Max(val, 0.7f);
+                    if (storm && !suppress) val = Mathf.Max(val, 1f);
+                    __result = Mathf.Clamp(val * Mathf.Clamp(a.weatherRainIntensity.Value, 0f, 2f), 0f, 2f);
+                }
+            }
+            else if (name == "get_Cloudiness")
+            {
+                if (clear) __result = 0f;
+                else if (rainy) __result = Mathf.Max(__result, 0.7f);
+                else if (storm && !suppress) __result = Mathf.Max(__result, 1f);
+            }
+            else if (name == "get_Wind")
+            {
+                if (suppress || clear) __result = 0f;
+                else if (storm) __result = Mathf.Max(__result, 1f);
+            }
+            else if (name == "get_ExtraPhysicsStress" || name == "get_SeaFlow")
+            {
+                if (suppress || clear) __result = 0f;
+            }
+        }
+
+        private void InspectWeatherApiOnce()
+        {
+            weatherApiInspected = true;
+            weatherApiPending = false;
+            // Discover native sea-level changers by exact name and signature, once.
+            // Never call SetSeaLevel here: that expects an absolute level, not a delta.
+            try
+            {
+                Assembly asm = typeof(CityConstruction).Assembly;
+                MethodInfo best = null;
+                object owner = null;
+                foreach (Type t in asm.GetTypes())
+                {
+                    if (t == null) continue;
+                    foreach (MethodInfo m in t.GetMethods(Flags | BindingFlags.DeclaredOnly))
+                    {
+                        if (m.Name != "AddSeaLevel" && m.Name != "ShiftSeaLevel") continue;
+                        ParameterInfo[] pars = m.GetParameters();
+                        if (pars.Length != 1 || (pars[0].ParameterType != typeof(int) && pars[0].ParameterType != typeof(float))) continue;
+                        if (m.ReturnType != typeof(void)) continue;
+                        object instance = null;
+                        if (!m.IsStatic)
+                        {
+                            if (!typeof(UnityEngine.Object).IsAssignableFrom(t)) continue;
+                            instance = UnityEngine.Object.FindObjectOfType(t);
+                            if (instance == null) continue;
+                        }
+                        // Prefer AddSeaLevel over ShiftSeaLevel if both exist.
+                        if (best == null || (m.Name == "AddSeaLevel" && best.Name != "AddSeaLevel"))
+                        { best = m; owner = instance; }
+                    }
+                }
+                weatherSeaDeltaMethod = best;
+                weatherSeaDeltaOwner = owner;
+                weatherSeaStatus = best != null ? "Sea control ready (native units)" : "Sea adjustment not supported by this build";
+                Logger.LogInfo("WEATHER SEA: " + (best == null ? "no supported native delta API" : best.DeclaringType.FullName + "." + best.Name + "(" + best.GetParameters()[0].ParameterType.Name + ")"));
+            }
+            catch (Exception ex) { weatherSeaStatus = "Sea control unavailable"; Logger.LogWarning("WEATHER SEA lookup: " + ex.Message); }
+            Logger.LogInfo("WEATHER READY: rain=" + weatherRainHookReady + " storm-modifiers=" + weatherStormHookReady + " sea=" + (weatherSeaDeltaMethod != null));
+        }
+
+        private void ChangeSeaLevel(float direction)
+        {
+            if (weatherSeaDeltaMethod == null || (!weatherSeaDeltaMethod.IsStatic && weatherSeaDeltaOwner == null))
+            { weatherSeaStatus = "Native sea-level API unavailable"; return; }
+            try
+            {
+                Type t = weatherSeaDeltaMethod.GetParameters()[0].ParameterType;
+                float value = Mathf.Clamp(weatherLevelStep.Value, 0.5f, 5f) * direction;
+                object parameter;
+                if (t == typeof(int))
+                {
+                    // Game API uses integer grid units; buffer half-step presses rather than rounding up.
+                    pendingSeaFraction += value;
+                    int units = (int)Math.Truncate(pendingSeaFraction);
+                    if (units == 0) { weatherSeaStatus = "Half-step queued (integer sea units)"; return; }
+                    pendingSeaFraction -= units;
+                    parameter = units;
+                    value = units;
+                }
+                else parameter = value;
+                weatherSeaDeltaMethod.Invoke(weatherSeaDeltaOwner, new object[] { parameter });
+                weatherSeaOffset += value;
+                weatherSeaStatus = "Sea adjusted: " + weatherSeaOffset.ToString("+0.##;-0.##;0") + " native units";
+                Logger.LogInfo("WEATHER SEA APPLIED: delta=" + value);
+            }
+            catch (Exception ex) { weatherSeaStatus = "Sea adjustment failed; check log"; Logger.LogWarning("WEATHER SEA: " + ex.Message); }
+        }
+
+        private void DrawWeatherTab()
+        {
+            GUI.Label(new Rect(19, 123, 520, 29), "WEATHER & SEA LEVEL", headingStyle);
+            GUI.Label(new Rect(20, 155, 520, 22), "Changes use game weather hooks; use a backup save.", mutedStyle);
+            GUI.Label(new Rect(20, 190, 250, 22), "SEA LEVEL STEP", bodyStyle);
+            float[] steps = { 0.5f, 1f, 2f, 5f };
+            for (int i=0;i<steps.Length;i++)
+            {
+                int k = i;
+                if (GUI.Button(new Rect(20 + i*103, 214, 96, 28), steps[k].ToString("0.#") + " units", Mathf.Abs(weatherLevelStep.Value - steps[k]) < 0.001f ? primaryStyle : buttonStyle))
+                    weatherLevelStep.Value = steps[k];
+            }
+            if (GUI.Button(new Rect(20, 252, 249, 29), "- LOWER SEA", buttonStyle)) ChangeSeaLevel(-1f);
+            if (GUI.Button(new Rect(284, 252, 257, 29), "+ RAISE SEA", primaryStyle)) ChangeSeaLevel(1f);
+            GUI.Label(new Rect(20, 284, 520, 21), weatherSeaStatus, mutedStyle);
+            GUI.Label(new Rect(20, 318, 200, 22), "STORMS", bodyStyle);
+            if (GUI.Button(new Rect(365, 310, 176, 30), weatherStormsDisabled.Value ? "SUPPRESS ON" : "NORMAL", weatherStormsDisabled.Value ? primaryStyle : buttonStyle))
+                weatherStormsDisabled.Value = !weatherStormsDisabled.Value;
+            GUI.Label(new Rect(20, 355, 240, 22), "RAIN INTENSITY", bodyStyle);
+            if (GUI.Button(new Rect(302, 347, 76, 29), "0%", weatherRainIntensity.Value == 0f ? primaryStyle : buttonStyle)) weatherRainIntensity.Value = 0f;
+            if (GUI.Button(new Rect(383, 347, 76, 29), "100%", weatherRainIntensity.Value == 1f ? primaryStyle : buttonStyle)) weatherRainIntensity.Value = 1f;
+            if (GUI.Button(new Rect(464, 347, 76, 29), "200%", weatherRainIntensity.Value == 2f ? primaryStyle : buttonStyle)) weatherRainIntensity.Value = 2f;
+            GUI.Label(new Rect(20, 397, 300, 22), "WEATHER PRESET", bodyStyle);
+            string[] presets = { "Default", "Clear", "Rain", "Storm" };
+            for (int i=0;i<presets.Length;i++)
+                if (GUI.Button(new Rect(20+i*132, 421, 123, 29), presets[i], weatherPreset.Value == presets[i] ? primaryStyle : buttonStyle))
+                    weatherPreset.Value = presets[i];
+            GUI.Label(new Rect(20, 459, 530, 30), "Rain / wind hooks: " + (weatherRainHookReady ? "active" : "unavailable") + ". Forecast and sky visuals may differ.", mutedStyle);
         }
 
         private void DrawCapacityTab()

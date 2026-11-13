@@ -1,33 +1,17 @@
-# All Will Fall Tweaks v0.9.5 — Stabilization
+# All Will Fall Tweaks v0.10.1 — Weather Direct Hooks (Experimental)
 
-Cleanup of the user-confirmed working v0.9.4 build. **Back up the v0.9.4 DLL and game save before installing.**
+Includes full v0.9.5 gameplay baseline.
 
-## Player-facing UI
+## Weather controls
+- Sea level Raise/Lower: finds native `AddSeaLevel` or `ShiftSeaLevel` once per city, then calls it from UI. Native units may not equal meters. If none matches, controls refuse to change level. Half-unit presses buffer when native API takes integers.
+- Rain intensity: patches `WeatherSegment.get_Raininess`.
+- Suppress storms: overrides `get_Wind`, `get_ExtraPhysicsStress`, and `get_SeaFlow`; does NOT cancel or rewrite scheduled weather blocks or storm sky VFX.
+- Weather presets Clear/Rain/Storm: change effective rain/cloud/wind parameters, not timeline blocks or full volume profiles. May have different effects on visuals and gameplay.
 
-Press **F8**. Six tabs: Resources, Capacity, Build, Research, Output, Citizens.
+This is experimental and not yet verified in game. BACK UP SAVE and v0.9.5 DLL before testing.
 
-- Removed all obsolete API scan buttons and technical hook counters from the GUI.
-- Removed development-only and experimental labels from player-facing controls.
-- Retained **Resources → Refresh** for manual refresh and capacity discovery.
-- Retained independently configurable options and persistent BepInEx settings.
+## Install
+Run `build.cmd` then `install.cmd`. Send `LogOutput.log` and screenshots after checking sea level, rain and storm changes.
 
 ## Performance
-
-- **Full scene storage discovery runs once when CityResourceManager first becomes ready** for each loaded city; capacity multipliers are applied in the same pass.
-- Lightweight registry-only updates occur at `BackgroundScanIntervalSeconds` (default 5 seconds).
-- **Removed the recurring 30-second full scene fallback**, avoiding `Resources.FindObjectsOfTypeAll` during ordinary gameplay.
-- Full discovery remains available via **Resources → Refresh**.
-- Unnecessary performance-timing stopwatch allocations removed from the scheduled scans.
-- Per-storage informational logs are suppressed unless `[Diagnostics] VerboseLogging = true`.
-
-If a building does not appear in the city's registry after construction, press Resources → Refresh once. The scan-on-city-load behavior is unchanged.
-
-## Existing features
-
-Resources, capacity, instant/free construction, instant/free research, production yield/speed, citizen happiness and needs, recruitment/HUD, movement speed, work speed and carry capacity are inherited from v0.9.4.
-
-## Build and install
-
-Set the game folder in `config.ps1` if needed, run `build.cmd` followed by `install.cmd`. Uses the game's installed managed DLLs. No proprietary DLLs redistributed.
-
-**Verification:** static source/ZIP checks performed; this build still needs a Windows compilation and in-game regression test.
+No recurring reflection scan. Native sea-level method lookup runs once at city initialization, and Harmony postfixes have constant-time logic.
